@@ -268,6 +268,7 @@ class SparseMoeWrapper(nn.Module):
 
         self.gate = gate
         self.experts = expert_cache
+        self.token_pattern_mask = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -281,6 +282,12 @@ class SparseMoeWrapper(nn.Module):
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
+        new_token_pattern_mask = torch.zeros(batch_size, sequence_length, self.num_experts).scatter_(
+                -1, selected_experts.view(batch_size, sequence_length, 2).cpu(), 1)
+        if self.token_pattern_mask is None:
+            self.token_pattern_mask = new_token_pattern_mask
+        else:
+            self.token_pattern_mask = torch.cat([self.token_pattern_mask, new_token_pattern_mask], dim=1)
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
         )

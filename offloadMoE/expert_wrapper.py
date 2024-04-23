@@ -38,6 +38,12 @@ class MixtralExpertWrapper(nn.Module):
         layer: tp.Any,
         device: torch.device,
     ):
+        '''
+        这个静态方法的目的是将传入的 layer（一个包含多个子层的模块）的所有张量转移到一个单一的 UntypedStorage 对象中。这样做的优点包括：
+        - 内存连续性：将所有小张量合并到一个大的连续内存块中，有助于减少内存碎片和提高缓存效率。
+        - 优化数据传输：在多设备环境下，如数据需要在 CPU 和 GPU 之间移动，使用单一的存储可以减少同步和数据传输的开销。
+        - 减少内存占用：相较于分散存储，连续存储往往可以更好地利用内存，减少总体占用空间。
+        '''
         state_dict = {
             f"w{i}": {
                 "W_q": getattr(layer, f"w{i}").W_q,

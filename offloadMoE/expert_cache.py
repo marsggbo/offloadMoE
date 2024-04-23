@@ -199,3 +199,58 @@ class ExpertCache:
         info_to_evict.index, info_to_load.index = info_to_load.index, info_to_evict.index
         self.group_infos[info_to_load.eviction_group].swap(info_to_load, info_to_evict)
         return device_expert_buffer
+
+    def prefetch(
+            self,
+            pattern_matrix,
+    ) -> Iterator[Tuple[ExpertUID, MixtralExpertWrapper]]:
+        """
+        Pre-fetches experts based on a provided activation matrix for future layers.
+
+        Args:
+            pattern_matrix (torch.Tensor): A matrix indicating the activation state of experts across layers.
+
+        Returns:
+            Iterator[Tuple[ExpertUID, MixtralExpertWrapper]]: Iterator for pre-fetched expert modules.
+        """
+        
+        num_layers, num_experts = pattern_matrix.shape
+
+        # 1. 统计出当前成 preloaded 和 offloaded 状态的 infos，根据 pattern_matrix 记录每个 expert 的状态：
+        #  1) 无需操作：当 pattern_matrix[layer_id, expert_id] == 1 时,且 info.offloaded=False，该 expert 需要被用到，且已经 preload在 GPU 上
+        #  1) 无需操作：当 pattern_matrix[layer_id, expert_id] == 0 时,且 info.offloaded=True，该 expert  不需要被用到，且已经 offload 在 GPU 上
+        #  2) 需要 offload：当 pattern_matrix[layer_id, expert_id] == 0 时,且 info.offloaded=False，该 expert 不需要被用到，但已经 preload 到 GPU 上
+        #  3）需要 preload: 当 pattern_matrix[layer_id, expert_id] == 1 时,且 info.offloaded=True，该 expert 需要被用到，但当前被 offload 到 CPU 上
+        
+        num_failed_preload = 0.
+        for layer_id in range(num_layers):
+            cpu2gpu_infos = []
+            gpu2cpu_infos = []
+            for expert_id in range(num_experts):
+                uid: ExpertUID = (layer_id, expert_id)
+                info = self.registered_experts.get(uid)
+                
+                # Skip if expert info is not found
+                if info is None:
+                    continue
+                required_on_gpu = pattern_matrix[layer_id, expert_id] == 1
+                if required_on_gpu and info.offloaded:
+                    cpu2gpu_infos.append(info)
+                elif not required_on_gpu and not info.offloaded:
+                    gpu2cpu_infos.append(info)
+
+            # Perform swaps
+            while cpu2gpu_infos and gpu2cpu_infos:
+                info_to_load = cpu2gpu_infos.pop()
+                info_to_evict = gpu2cpu_infos.pop()
+                # print(f"Swaping {info_to_load.uid}(cpu) to {info_to_evict.uid}(gpu)")
+                self._swap(info_to_load, info_to_evict)
+            
+            # Todo: 支持在不同层之间的 expert 互相替换。
+            # Todo: 因为每层的 expert 激活数量可能不一致，比如第一层只激活了 2 个，第二个需要激活 8 个（默认激活 4 个，offload4 个），那么已经 offload 的 4 个可以挪到第一层中去
+            # Check remaining unprocessed experts due to imbalance in requirements
+            # if len(cpu2gpu_infos) > 0:
+            #     num_failed_preload += len(cpu2gpu_infos)
+            #     failed_uids = [e.uid for e in cpu2gpu_infos]
+            #     print(f"Layer{layer_id} has {len(cpu2gpu_infos)} experts {failed_uids} that cannot be preloaded.")
+                    
