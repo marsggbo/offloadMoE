@@ -856,7 +856,10 @@ class MixtralSparseMoeBlock(nn.Module):
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
-        n_local_experts = config.num_local_experts // self.mp_size
+        if getattr(config, 'offload', False):
+            n_local_experts = config.num_local_experts // self.mp_size
+        else:
+            n_local_experts = 0
         self.local_expert_indices = [i for i in range(
             n_local_experts*self.mp_rank, n_local_experts*(self.mp_rank+1))]
 
@@ -1734,6 +1737,217 @@ class MixtralForSequenceClassification(MixtralPreTrainedModel):
             attentions=transformer_outputs.attentions,
         )
 
+def build_offload_model(config=None):
+    
+    from offloadMoE.expert_cache import ExpertCache
+    from offloadMoE.custom_layers import SparseMoeWrapper
+    from offloadMoE.utils import nested_flatten, nested_pack, with_default_dtype
+    from dataclasses import dataclass
+    from transformers import AutoConfig
+    import json
+    import os
+    import typing as tp
+
+
+    class MixtralExpertWrapper(nn.Module):
+        def __init__(
+            self,
+            expert_module: tp.Any,
+            device: torch.device,
+        ):
+            super().__init__()
+            
+            self.expert_module, self.storage = self.replace_layer_storage(expert_module, device)
+            # self.expert_module = lambda *args, **kwargs: expert_module(*args, **kwargs)
+            
+            self._register_state_dict_hook(self._add_storage_to_state_dict_hook)
+            self._register_load_state_dict_pre_hook(self._load_storage_from_state_dict_hook)
+
+        @staticmethod
+        def _add_storage_to_state_dict_hook(self, state_dict, prefix, local_metadata):
+            state_dict[prefix + 'storage'] = torch.as_tensor(self.storage, dtype=torch.bfloat16)
+            return state_dict
+
+        def _load_storage_from_state_dict_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+            self.storage.copy_(state_dict[prefix + 'storage'].storage().untyped())
+            del state_dict[prefix + 'storage']
+
+        def forward(self, *args, **kwargs):
+            return self.expert_module(*args, **kwargs)
+
+        @staticmethod
+        def replace_layer_storage(
+            layer: tp.Any,
+            device: torch.device,
+        ):
+            '''
+            这个静态方法的目的是将传入的 layer（一个包含多个子层的模块）的所有张量转移到一个单一的 UntypedStorage 对象中。这样做的优点包括：
+            - 内存连续性：将所有小张量合并到一个大的连续内存块中，有助于减少内存碎片和提高缓存效率。
+            - 优化数据传输：在多设备环境下，如数据需要在 CPU 和 GPU 之间移动，使用单一的存储可以减少同步和数据传输的开销。
+            - 减少内存占用：相较于分散存储，连续存储往往可以更好地利用内存，减少总体占用空间。
+            '''
+            state_dict = {
+                f"w{i}": {
+                    "weight": getattr(layer, f"w{i}").weight,
+                }
+                for i in range(1, 4)
+            }
+
+            storage_size = 0
+            offsets = [0]
+
+            for x in nested_flatten(state_dict):
+                if not isinstance(x, torch.Tensor):
+                    continue
+                storage_size += x.nbytes
+                offsets.append(storage_size)
+
+            storage = torch.UntypedStorage(storage_size, device=device) 
+
+            i = 0
+            new_flattened_states = list()
+            for x in nested_flatten(state_dict):
+                if not isinstance(x, torch.Tensor):
+                    new_flattened_states.append(x)
+                    continue
+
+                start = offsets[i]
+                end = offsets[i + 1]
+                a_view = torch.as_tensor(storage[start:end], dtype=x.dtype, device=device).view(x.shape)
+                a_view[...] = x
+                assert a_view.data_ptr() == storage.data_ptr() + start
+                i += 1
+                new_flattened_states.append(a_view)
+
+            state_dict = nested_pack(new_flattened_states, state_dict)
+
+            for layer_id, states in state_dict.items():
+                patched = getattr(layer, layer_id)
+                patched.weight = nn.Parameter(states['weight'])
+                setattr(layer, layer_id, patched)
+
+            return layer, storage
+
+    @dataclass(frozen=True)
+    class OffloadConfig:
+        main_size: int
+        offload_size: int
+        buffer_size: int
+        offload_per_layer: int
+
+    def make_empty_expert(
+        model_config: MixtralConfig
+    ) -> MixtralBlockSparseTop2MLP:
+        return MixtralBlockSparseTop2MLP(
+            model_config,
+        )
+
+    def make_and_load_expert_wrapper(
+        config: MixtralConfig,
+        states_dir: str,
+        expert_uid: tuple[int, int],
+        device: torch.device,
+    ) -> MixtralExpertWrapper:
+        layer_idx, expert_idx = expert_uid
+
+        index_path = os.path.join(states_dir, "model.safetensors.index.json")
+        with open(index_path) as f:
+            module_idx = f"model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}"
+            weight_map = json.load(f)["weight_map"]
+            state_fpaths = [weight_map[f"{module_idx}.w{i}.weight"] for i in [1,2,3]]
+            assert len(set(state_fpaths))==1
+            state_fpath = state_fpaths[0]
+
+        state_dict = load_file(os.path.join(states_dir, state_fpath), device=str(device))
+        expert = make_empty_expert(config).bfloat16()
+        for idx in range(1, 4):
+            layer = getattr(expert, f"w{idx}")
+            w_to_load = state_dict[f'model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w{idx}.weight']
+            layer.weight.data.copy_(w_to_load)
+
+        return MixtralExpertWrapper(expert, device)
+
+    def load_00_expert_state_dict(states_dir: str, device: torch.device):
+        index_path = os.path.join(states_dir, "model.safetensors.index.json")
+        with open(index_path) as f:
+            module_idx = f"model.layers.0.block_sparse_moe.experts.0"
+            state_fpath = json.load(f)["weight_map"][f"{module_idx}.w1.weight"]
+        return load_file(os.path.join(states_dir, state_fpath), device=str(device))
+
+    device = torch.device("cuda:0")
+    model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+    if config is None:
+        config = AutoConfig.from_pretrained(
+            model_name,
+            num_local_experts=8,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
+        )
+        config.offload = True
+      
+    config.num_hidden_layers = 1
+    state_path = '/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/1e637f2d7cb0a9d6fb1922f305cb784995190a83'
+    state_dict_00 = load_00_expert_state_dict(state_path, device)
+    ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
+    offload_per_layer = 4
+    # offload_per_layer = 5
+    ###############################################################
+
+    num_experts = config.num_local_experts
+    offload_config = OffloadConfig(
+        main_size=config.num_hidden_layers * (num_experts - offload_per_layer),
+        offload_size=config.num_hidden_layers * offload_per_layer,
+        buffer_size=4,
+        offload_per_layer=offload_per_layer,
+    )
+
+    def _make_module():
+        config = AutoConfig.from_pretrained(model_name)
+        expert = make_empty_expert(config).bfloat16()
+        # expert.load_state_dict(state_dict_00)
+        return MixtralExpertWrapper(expert, device=device)
+
+    with device, with_default_dtype(torch.bfloat16):
+        model = MixtralForCausalLM(config)
+
+    model_config = config
+    expert_cache = ExpertCache(
+        make_module=_make_module,
+        main_size=offload_config.main_size,
+        offload_size=offload_config.offload_size,
+        buffer_size=offload_config.buffer_size,
+    )
+    for layer_idx in range(model_config.num_hidden_layers):
+        curr_layer = model.model.layers[layer_idx]
+        curr_layer.block_sparse_moe = SparseMoeWrapper(
+            model_config,
+            layer_idx,
+            curr_layer.block_sparse_moe.gate,
+            expert_cache,
+        )
+
+        for expert_idx in range(model_config.num_local_experts):
+            do_offload = expert_idx < offload_config.offload_per_layer
+
+            expert_wrapper = make_and_load_expert_wrapper(
+                config=model_config,
+                states_dir=state_path,
+                expert_uid=(layer_idx, expert_idx),
+                device=device,
+            )
+
+            expert_cache.add_expert(
+                uid=(layer_idx, expert_idx),
+                module=expert_wrapper,
+                eviction_group=layer_idx,
+                offload=do_offload,
+            )
+
+            del expert_wrapper
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+    print(model)
+    return model
 
 
 if __name__ == '__main__':
@@ -1755,42 +1969,50 @@ if __name__ == '__main__':
     init_env()
     rank = dist.get_rank()
     device = f"cuda:{rank}" if torch.cuda.is_available() else 'cpu'
-
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
-    tokenizer.padding_side = 'left'
-    tokenizer.pad_token = tokenizer.unk_token
-    config = MixtralConfig.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
-    config.num_hidden_layers = 2 # for debug when #GPU limits
-    print('Init model...')
-    model = MixtralForCausalLM(config)
+    model = build_offload_model()
     model = model.bfloat16()
-    model.eval()
-
-    print('Loading weights from safetensor files...')
-    model_safetensor_index_file = glob(
-        "/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/*/model.safetensors.index.json")[0]
-    ckpt_files = glob(f'/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/*/*.safetensors')
-    model.load_state_dict_from_safetensor_files(ckpt_files)
     model = model.to(device)
-    print('Loading weights from safetensor files. Finished')
+    print(model)
+    x = torch.randint(0,100,(2,10)).to(device)
+    attention_mask = torch.ones(2,10).to(device)
+    out = model(x)
+    print(out.logits.shape)
 
-    data = tokenizer(
-        [
-            "summarize: studies have shown that owning a dog is good for you",
-            "tell me a joke",
-            # "summarize: As a cache eviction algorithm, FIFO has a lot of attractive properties, such as simplicity, speed, scalability, and flash-friendliness. The most prominent criticism of FIFO is its low efficiency (high miss ratio). In this work, we demonstrate a simple, scalable FIFObased algorithm with three static queues (S3-FIFO). Evaluated on 6594 cache traces from 14 datasets, we show that S3- FIFO has lower miss ratios than state-of-the-art algorithms across traces. Moreover, S3-FIFO’s efficiency is robust — it has the lowest mean miss ratio on 10 of the 14 datasets. FIFO queues enable S3-FIFO to achieve good scalability with 6× higherthroughput compared to optimized LRU at 16 threads. Our insight is that most objects in skewed workloads will only be accessed once in a short window, so it is critical to evict them early (also called quick demotion). The key of S3-FIFO is a small FIFO queue that filters out most objects from entering the main cache, which provides a guaranteed demotion speed and high demotion precision."
-        ], return_tensors="pt", padding=True, return_attention_mask=True
-    )  # Batch size 1
-    input_ids = data.input_ids.to(device)
-    attention_mask = data.attention_mask.to(device)
-    y = model(input_ids=input_ids, attention_mask=attention_mask)
-    print(y.logits.shape)
-    for i in range(10):
-        do_sample = i > -1
-        outputs = model.generate(
-            input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=2, do_sample=do_sample, temperature=0.8, top_k=100)
-        print(tokenizer.decode(outputs[0]))
+    # tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
+    # tokenizer.padding_side = 'left'
+    # tokenizer.pad_token = tokenizer.unk_token
+    # config = MixtralConfig.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
+    # config.num_hidden_layers = 2 # for debug when #GPU limits
+    # print('Init model...')
+    # model = MixtralForCausalLM(config)
+    # model = model.bfloat16()
+    # model.eval()
+
+    # print('Loading weights from safetensor files...')
+    # model_safetensor_index_file = glob(
+    #     "/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/*/model.safetensors.index.json")[0]
+    # ckpt_files = glob(f'/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/*/*.safetensors')
+    # model.load_state_dict_from_safetensor_files(ckpt_files)
+    # model = model.to(device)
+    # print('Loading weights from safetensor files. Finished')
+
+    # data = tokenizer(
+    #     [
+    #         "summarize: studies have shown that owning a dog is good for you",
+    #         "tell me a joke",
+    #         # "summarize: As a cache eviction algorithm, FIFO has a lot of attractive properties, such as simplicity, speed, scalability, and flash-friendliness. The most prominent criticism of FIFO is its low efficiency (high miss ratio). In this work, we demonstrate a simple, scalable FIFObased algorithm with three static queues (S3-FIFO). Evaluated on 6594 cache traces from 14 datasets, we show that S3- FIFO has lower miss ratios than state-of-the-art algorithms across traces. Moreover, S3-FIFO’s efficiency is robust — it has the lowest mean miss ratio on 10 of the 14 datasets. FIFO queues enable S3-FIFO to achieve good scalability with 6× higherthroughput compared to optimized LRU at 16 threads. Our insight is that most objects in skewed workloads will only be accessed once in a short window, so it is critical to evict them early (also called quick demotion). The key of S3-FIFO is a small FIFO queue that filters out most objects from entering the main cache, which provides a guaranteed demotion speed and high demotion precision."
+    #     ], return_tensors="pt", padding=True, return_attention_mask=True
+    # )  # Batch size 1
+    # input_ids = data.input_ids.to(device)
+    # attention_mask = data.attention_mask.to(device)
+    # y = model(input_ids=input_ids, attention_mask=attention_mask)
+    # print(y.logits.shape)
+    # for i in range(10):
+    #     do_sample = i > -1
+    #     outputs = model.generate(
+    #         input_ids,
+    #         attention_mask=attention_mask,
+    #         max_new_tokens=2, do_sample=do_sample, temperature=0.8, top_k=100)
+    #     print(tokenizer.decode(outputs[0]))
 
 # torchrun --nproc-per-node=8 --master-port=6869 modeling_mixtral.py

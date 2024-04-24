@@ -8,9 +8,20 @@ from transformers import AutoConfig, AutoTokenizer
 from datasets import load_dataset
 from transformers import TextStreamer
 
-from hqq.core.quantize import BaseQuantizeConfig
-from offloadMoE.build_model import OffloadConfig, QuantConfig, build_model
+from offloadMoE.build_model import OffloadConfig, build_model
 from offloadMoE.custom_layers import SparseMoeWrapper
+from offloadMoE.modeling_mixtral import build_offload_model
+
+import os
+import torch.distributed as dist
+from accessory.util import misc
+from glob import glob
+import fairscale.nn.model_parallel.initialize as fs_init
+
+def init_env():
+    # define the model
+    misc.init_distributed_mode()
+    fs_init.initialize_model_parallel(dist.get_world_size())
 
 
 def load_json(file):
@@ -64,6 +75,13 @@ def prepare_data(dataset_list: Dict[str,int]):
 
 
 def main():
+    if os.environ.get('ipdb', False):
+        from ipdb import set_trace
+        set_trace()
+
+    init_env()
+    rank = dist.get_rank()
+
     dataset_list = {
         'alpaca': 1000,
         # 'sst2': 1000,
@@ -79,48 +97,19 @@ def main():
     # data = np.array(data)[indices]
     data = np.array(sorted(data, key=len))
 
-    print(f'Building and Loading a MoE model...')
+    device = f"cuda:{rank}" if torch.cuda.is_available() else 'cpu'
     model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-    quantized_model_name = "lavawolfiee/Mixtral-8x7B-Instruct-v0.1-offloading-demo"
-    state_path = "/home/nus-hx/code/offloadMoE/data"
-
-    config = AutoConfig.from_pretrained(quantized_model_name)
-    device = torch.device("cuda:0")
-    ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
-    offload_per_layer = 4
-    # offload_per_layer = 5
-    ###############################################################
-
-    num_experts = config.num_local_experts
-    offload_config = OffloadConfig(
-        main_size=config.num_hidden_layers * (num_experts - offload_per_layer),
-        offload_size=config.num_hidden_layers * offload_per_layer,
-        buffer_size=4,
-        offload_per_layer=offload_per_layer,
+    config = AutoConfig.from_pretrained(
+        model_name,
+        num_local_experts=8,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
     )
-
-    attn_config = BaseQuantizeConfig(
-        nbits=4,
-        group_size=64,
-        quant_zero=True,
-        quant_scale=True,
-    )
-    attn_config["scale_quant_params"]["group_size"] = 256
-    ffn_config = BaseQuantizeConfig(
-        nbits=2,
-        group_size=16,
-        quant_zero=True,
-        quant_scale=True,
-    )
-    quant_config = QuantConfig(ffn_config=ffn_config, attn_config=attn_config)
-
-    model = build_model(
-        device=device,
-        quant_config=quant_config,
-        offload_config=offload_config,
-        state_path=state_path,
-    )
-
+    config.offload = True
+    config.num_hidden_layers = 1 # for debug only
+    model = build_offload_model(config)
+    model = model.bfloat16()
+    model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
