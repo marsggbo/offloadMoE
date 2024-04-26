@@ -1,6 +1,7 @@
 import sys
 from typing import List, Optional, Tuple, Union, Dict
 import time
+import os
 import torch
 import json
 import numpy as np
@@ -72,32 +73,12 @@ def prepare_data(dataset_list: Dict[str,int]):
     print(f"The data contains {len(data)} samples.")
     return data
 
-
-def main():
-    # init_env()
-
-    dataset_list = {
-        'alpaca': 1000,
-        # 'sst2': 1000,
-        # 'mrpc': 1000,
-        # 'tick666-math': 1000,
-        # 'yizhongw': 1000
-    }
-    print(f'Building dataset including {dataset_list}')
-    batch_size = 4
-    data = prepare_data(dataset_list)
-    # indices = list(range(len(data)))
-    # np.random.shuffle(indices)
-    # data = np.array(data)[indices]
-    data = np.array(sorted(data, key=len))
-
+def prepare_model(device):
     print(f'Building and Loading a MoE model...')
-    model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
     quantized_model_name = "lavawolfiee/Mixtral-8x7B-Instruct-v0.1-offloading-demo"
     state_path = "/home/scratch.shunkangz_gpu/Research/NUS_Project/Checkpoint/models--lavawolfiee--Mixtral-8x7B-Instruct-v0.1-offloading-demo/snapshots/3d47c8315811b9e0135d4fac21deb88309c6551c"
 
     config = AutoConfig.from_pretrained(quantized_model_name)
-    device = torch.device("cuda:0")
     ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
     offload_per_layer = 4
     # offload_per_layer = 5
@@ -132,16 +113,81 @@ def main():
         offload_config=offload_config,
         state_path=state_path,
     )
+    return model
+    
 
+def main(args):
+    dataset_list = {
+        'alpaca': 8,
+        # 'sst2': 1000,
+        # 'mrpc': 1000,
+        # 'tick666-math': 1000,
+        # 'yizhongw': 1000
+    }
+    print(f'Building dataset including {dataset_list}')
+    data = prepare_data(dataset_list)
+    ###### random order
+    # indices = list(range(len(data)))
+    # np.random.shuffle(indices)
+    # data = np.array(data)[indices]
+    ###### length-sorted order
+    data = np.array(sorted(data, key=len))
+    batch_size = 8
+    batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
+
+    device = torch.device("cuda:0")
+    model = prepare_model(device)
+    model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+    max_new_tokens = 64
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
-    batch_size = 8
-    batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
-    num_tokens = []
+    ###### baseline: original implementation
+    if args.task == 0:
+        run_benchmark(model, tokenizer, batches, max_new_tokens, device)
 
+    ###### get pattern matrices of given batches of requests, including prefilling and decoding tokens
+    elif args.task ==1:
+        pattern_matrices = get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device)
+
+    ###### Idea: run with ground truth of pattern matrices
+    elif args.task == 2:
+        os.environ['TRACE_PATTERN'] = "1"
+        pattern_matrices = torch.load(args.pattern_matrices_path)
+        run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, device, pattern_matrices)
+
+    elif args.task == 3:
+        predictor = ...
+        run_benchmark_with_predictor(model, tokenizer, batches, max_new_tokens, device, predictor)
+
+    else:
+        raise NotImplementedError
+
+def run_benchmark(model, tokenizer, batches, max_new_tokens, device):
+    num_tokens = []
+    torch.cuda.synchronize()
+    start = time.time()
+    for batch_idx, batch in enumerate(batches):
+        batch = batch.tolist()
+        data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
+        data = {key: val.to(device) for key, val in data.items()}
+        num_tokens.append(data['input_ids'].numel())
+        batch_start = time.time()
+        generated_token_ids = custom_generate(
+            data['input_ids'], data['attention_mask'], model, max_new_tokens=max_new_tokens, predictor=None
+        )
+        batch_end = time.time()
+        print(f"Processing batch {batch_idx} generated_token_ids.shape={generated_token_ids.shape} time costs: {batch_end-batch_start:.4f}s")
+    torch.cuda.synchronize()
+    end = time.time()
+    total_num_tokens = np.sum(num_tokens)
+    throughput = total_num_tokens / (end - start)
+    print(f"Throughput: {total_num_tokens} tokens/{end-start} sec = {throughput} tokens/s")
+
+
+def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
     # Initialize a dictionary to hold the activations
-    activations_record = {
+    pattern_matrices = {
         # 0: {
         #     'prompt_text': "this is a prompt",
         #     'token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
@@ -150,60 +196,66 @@ def main():
         # 1: {},
         # ...
     }
-    compute_stream = torch.cuda.Stream()
+    for batch_idx, batch in enumerate(batches):
+        batch = batch.tolist()
+        data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
+        data = {key: val.to(device) for key, val in data.items()}
+        generated_token_ids = custom_generate(
+            data['input_ids'], data['attention_mask'], model, max_new_tokens=max_new_tokens, predictor=None
+        )
+        token_pattern_matrices_list = []
+        for layer in model.modules():
+            if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
+                token_pattern_matrices_list.append(layer.token_pattern_mask) # (bs, seq_len, num_experts)
+        token_pattern_matrices_list = torch.stack(token_pattern_matrices_list, dim=-2) # (bs, seq_len, num_layers, num_experts)
+        for i, text in enumerate(batch):
+            pattern_matrices[len(batch)*batch_idx+i] = {
+                'prompt_text': text,
+                'prompt_token_ids': data['input_ids'][i].cpu(),
+                'token_ids': generated_token_ids[i].detach().cpu(),
+                'token_pattern_matrices': token_pattern_matrices_list[i]
+            }
+        for layer in model.modules():
+            if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
+                layer.token_pattern_mask = None
+    torch.save(pattern_matrices, 'pattern_matrices.pt')
+    return pattern_matrices
+
+
+def run_benchmark_with_predictor(model, tokenizer, batches, max_new_tokens, device, predictor):
+    # Initialize a dictionary to hold the activations
+    num_tokens = []
     torch.cuda.synchronize()
     start = time.time()
-    torch.cuda.cudart().cudaProfilerStart()
-    with torch_profiler.emit_nvtx(record_shapes=True):
-        for batch_idx, batch in enumerate(batches):
-            torch.cuda.nvtx.range_push(f'Batch {batch_idx}')
-            batch = batch.tolist()
-            data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
-            data = {key: val.to(device) for key, val in data.items()}
-            num_tokens.append(data['input_ids'].numel())
-            batch_start = time.time()
-            with torch.cuda.stream(compute_stream):
-                generated_token_ids = custom_generate(
-                    data['input_ids'], data['attention_mask'], model, max_new_tokens=3, predictor=None
-                )
-            batch_end = time.time()
-            token_pattern_matrices_list = []
-            for layer in model.modules():
-                if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
-                    token_pattern_matrices_list.append(layer.token_pattern_mask) # (bs, seq_len, num_experts)
-            token_pattern_matrices_list = torch.stack(token_pattern_matrices_list, dim=-1) # (bs, seq_len, num_layers, num_experts)
-            for i, text in enumerate(batch):
-                activations_record[len(batch)*batch_idx+i] = {
-                    'prompt_text': text,
-                    'prompt_token_ids': data['input_ids'][i].cpu(),
-                    'token_ids': generated_token_ids[i].detach().cpu(),
-                    'token_pattern_matrices': token_pattern_matrices_list[i]
-                }
-            for layer in model.modules():
-                if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
-                    layer.token_pattern_mask = None
-            # print(tokenizer.batch_decode(result.cpu().numpy().tolist(), skip_special_tokens=True))
-            print(f"Processing batch {batch_idx} data.input_ids.shape={data['input_ids'].shape} time costs: {batch_end-batch_start:.4f}s")
-            torch.cuda.nvtx.range_pop()
-            if batch_idx == 1:
-                break
+    
+    for batch_idx, batch in enumerate(batches):
+        batch = batch.tolist()
+        data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
+        data = {key: val.to(device) for key, val in data.items()}
+        num_tokens.append(data['input_ids'].numel())
+        batch_start = time.time()
+        generated_token_ids = custom_generate(
+            data['input_ids'], data['attention_mask'], model, max_new_tokens=max_new_tokens, predictor=None
+        )
+        batch_end = time.time()
+        print(f"Processing batch {batch_idx} data.input_ids.shape={data['input_ids'].shape} time costs: {batch_end-batch_start:.4f}s")
     torch.cuda.synchronize()
     torch.cuda.cudart().cudaProfilerStop()
     end = time.time()
-    torch.save(activations_record, 'activations_record.pt')
     total_num_tokens = np.sum(num_tokens)
     throughput = total_num_tokens / (end - start)
     print(f"Throughput: {total_num_tokens} tokens/{end-start} sec = {throughput} tokens/s")
 
 
 def prefetch_experts_by_predictor(model, input_ids, attention_mask, predictor):
-    if predictor == 'random':
+    if predictor == 'random': # for debug
         pattern_matrix = torch.randint(0, 2, (32, 8))
     else:
         ...
     
     for i, layer in enumerate(model.model.layers):
         layer.block_sparse_moe.experts.prefetch(pattern_matrix)
+
 
 def custom_generate(
     input_ids,
@@ -213,7 +265,6 @@ def custom_generate(
     past_key_values=None,
     temperature=0.9,
     top_p=0.9,
-    top_k=50,
     predictor=None
 ):
     """
@@ -230,8 +281,7 @@ def custom_generate(
 
     Returns:
     torch.Tensor: Tensor containing the generated token ids.
-    """        
-    global activations_record
+    """
     model.eval()  # Put model in evaluation mode
     with torch.no_grad():  # Disable gradient calculation
         # Initialize variables to store outputs and past_key_values
@@ -257,9 +307,7 @@ def custom_generate(
             logits = outputs.logits[:, -1, :] / temperature
 
             # Apply top-p nucleus sampling
-            if top_k is not None:
-                filtered_logits = top_k_filtering(logits, top_k=top_k)
-            elif top_p is not None:
+            if top_p is not None:
                 filtered_logits = top_p_filtering(logits, top_p=top_p)
             else:
                 filtered_logits = logits
@@ -274,6 +322,7 @@ def custom_generate(
             attention_mask = torch.cat([attention_mask, torch.ones((input_ids.size(0), 1), device=attention_mask.device)], dim=-1)
 
         return generated_token_ids
+
 
 def top_p_filtering(logits, top_p=0.9):
     """
@@ -300,22 +349,128 @@ def top_p_filtering(logits, top_p=0.9):
     logits[indices_to_remove] = float('-inf')
     return logits
 
-def top_k_filtering(logits, top_k=10):
-    """
-    Filter a distribution of logits using top-k sampling
 
-    Args:
-    logits (torch.Tensor): The logits output by the model.
-    top_k (int): The number of top elements to keep.
+def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, device, pattern_matrices):
+    def prefetch_experts_by_pattern_matrices(model, pattern_matrix):
+        for i, layer in enumerate(model.model.layers):
+            layer.block_sparse_moe.experts.prefetch(pattern_matrix)
 
-    Returns:
-    torch.Tensor: The filtered logits.
-    """
-    top_k_values, top_k_indices = torch.topk(logits, top_k, sorted=False)
-    mask = torch.ones_like(logits, dtype=torch.bool)
-    mask.scatter_(1, top_k_indices, False)
-    logits[mask] = float('-inf')
-    return logits
+    get_batch_data = lambda key, batch: torch.stack([batch[i][key] for i in range(len(batch))], dim=0)
+
+    def create_attention_mask(token_ids):
+        # token_ids 是一个 (num_samples, seq_len) 的 PyTorch 张量
+        seq_len = token_ids.size(1)
+        
+        # 找到每行第一个1出现的位置
+        # cumsum 累积和将从第一个1开始生成非零值
+        ones_and_zeros = (token_ids == 1).long()  # 将token等于1的位置变为1，其余为0
+        cum_sum = torch.cumsum(ones_and_zeros, dim=1)
+        
+        # 生成 mask：cum_sum 大于0的位置表示这之后（包括该位置）应该是1
+        attention_mask = cum_sum > 0
+
+        return attention_mask.to(token_ids.device)
+
+    def custom_generate_with_fixed_data(
+        batch,
+        model,
+        max_new_tokens=128,
+        past_key_values=None,
+        temperature=0.9,
+        top_p=0.9,
+    ):
+        model.eval()  # Put model in evaluation mode
+        num_layers, num_experts = batch[0]['token_pattern_matrices'].shape[-2:]
+        all_pattern_matrices = get_batch_data('token_pattern_matrices', batch) # (num_samples, prompt_len, 32, 8)
+        all_token_ids = get_batch_data('token_ids', batch) # (num_samples, prompt_len+decoding_len)
+        attention_mask = None
+        with torch.no_grad():  # Disable gradient calculation
+            # Initialize variables to store outputs and past_key_values
+            generated_token_ids = None
+            crt_tokens = None
+
+            for token_index in range(max_new_tokens):
+                if token_index == 0:
+                    # prefilling
+                    prompt_len = len(batch[0]['prompt_token_ids'])
+                    pattern_matrices = all_pattern_matrices[:, :prompt_len, :, :] # (num_samples, prompt_len, 32, 8)
+                    pattern_matrix = pattern_matrices.sum(0).sum(0) # (32, 8)
+                    crt_tokens = all_token_ids[:, :prompt_len]
+                    generated_token_ids = crt_tokens
+                    attention_mask = create_attention_mask(crt_tokens)
+                else:
+                    # decoding
+                    pattern_matrices = all_pattern_matrices[:, prompt_len+token_index-1, :, :] # (num_samples, 1, 32, 8)
+                    pattern_matrix = pattern_matrices.sum(0) # (32, 8)
+                    crt_tokens = all_token_ids[:, prompt_len+token_index-1].view(-1, 1)
+                    attention_mask = torch.cat([attention_mask, torch.ones((len(batch), 1), device=attention_mask.device)], dim=-1)
+                    generated_token_ids = torch.cat((generated_token_ids, crt_tokens), dim=1)
+                prefetch_experts_by_pattern_matrices(
+                    model, pattern_matrix
+                )
+                outputs = model(
+                    input_ids=crt_tokens,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True  # Informs the model to return past key-values
+                )
+
+                # Update past_key_values for the next iteration
+                past_key_values = outputs.past_key_values
+
+                # Obtain logits
+                logits = outputs.logits[:, -1, :] / temperature
+
+                # Apply top-p nucleus sampling
+                if top_p is not None:
+                    filtered_logits = top_p_filtering(logits, top_p=top_p)
+                else:
+                    filtered_logits = logits
+                probabilities = torch.nn.functional.softmax(filtered_logits, dim=-1)
+
+                # Sample from the filtered distribution
+                next_token_id = torch.multinomial(probabilities, num_samples=1)
+
+                # Update the attention_mask for new token
+                attention_mask2 = torch.cat([attention_mask, torch.ones((len(batch), 1), device=attention_mask.device)], dim=-1)
+
+            return generated_token_ids
+
+    # Initialize a dictionary to hold the activations
+    # pattern_matrices = {
+    #     0: {
+    #         'prompt_text': "this is a prompt",
+    #         'prompt_token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
+    #         'token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
+    #         'token_pattern_matrices': # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
+    #     },
+    #     1: {},
+    #     ...
+    # }
+    num_tokens = []
+    for i in range(len(pattern_matrices)):
+        pattern_matrices[i]['token_ids'] = pattern_matrices[i]['token_ids'].to(device)
+        pattern_matrices[i]['token_pattern_matrices'] = pattern_matrices[i]['token_pattern_matrices'].to(device)
+    
+    torch.cuda.synchronize()
+    start = time.time()
+    batch_indices = list(pattern_matrices.keys())
+    batch_indices = [batch_indices[i:i + batch_size] for i in range(0, len(batch_indices), batch_size)]
+    batches = [[pattern_matrices[i] for i in indices] for indices in batch_indices]
+
+    for batch_idx, batch in enumerate(batches):
+        batch_start = time.time()
+        generated_token_ids = custom_generate_with_fixed_data(
+            batch, model, max_new_tokens=max_new_tokens
+        )
+        batch_end = time.time()
+        num_tokens.append(generated_token_ids.numel())
+        print(f"Processing batch {batch_idx} generated_token_ids.shape={generated_token_ids.shape} time costs: {batch_end-batch_start:.4f}s")
+    torch.cuda.synchronize()
+    end = time.time()
+    total_num_tokens = np.sum(num_tokens)
+    throughput = total_num_tokens / (end - start)
+    print(f"Throughput: {total_num_tokens} tokens/{end-start} sec = {throughput} tokens/s")
 
 
 def test_custom_generate():
@@ -343,5 +498,20 @@ def test_custom_generate():
 
     
 if __name__ == '__main__':
-    main()
+    import argparse
+
+    # 创建 ArgumentParser 对象
+    parser = argparse.ArgumentParser(description='Benchmark on a single GPU')
+
+    # 添加参数
+    parser.add_argument('--task', type=int, choices=[0, 1, 2, 3], default='0', help='Task to perform')
+    # 0: running original implementation
+    # 1: get and save pattern matrices for given bacthes of requests, including prefilling and decoding tokens
+    # 2: run custom_generate with prefetched pattern matrices
+    # 3: run custom_generate with pattern matrices predictor
+    parser.add_argument('--pattern_matrices_path', type=str, default='pattern_matrices.pt', help='Path to pattern matrices')
+
+    # 解析命令行输入
+    args = parser.parse_args()
+    main(args)
     # test_custom_generate()
