@@ -167,7 +167,7 @@ def run_benchmark(model, tokenizer, batches, max_new_tokens, device):
             data['input_ids'], data['attention_mask'], model, max_new_tokens=max_new_tokens, predictor=None
         )
         batch_end = time.time()
-        print(f"Processing batch {batch_idx} data.input_ids.shape={data['input_ids'].shape} time costs: {batch_end-batch_start:.4f}s")
+        print(f"Processing batch {batch_idx} generated_token_ids.shape={generated_token_ids.shape} time costs: {batch_end-batch_start:.4f}s")
     torch.cuda.synchronize()
     end = time.time()
     total_num_tokens = np.sum(num_tokens)
@@ -454,7 +454,7 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
         )
         batch_end = time.time()
         num_tokens.append(generated_token_ids.numel())
-        print(f"Processing batch {batch_idx} time costs: {batch_end-batch_start:.4f}s")
+        print(f"Processing batch {batch_idx} generated_token_ids.shape={generated_token_ids.shape} time costs: {batch_end-batch_start:.4f}s")
     torch.cuda.synchronize()
     end = time.time()
     total_num_tokens = np.sum(num_tokens)
