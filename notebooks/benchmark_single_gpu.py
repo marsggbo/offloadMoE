@@ -375,7 +375,8 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
         attention_mask = None
         with torch.no_grad():  # Disable gradient calculation
             # Initialize variables to store outputs and past_key_values
-            generated_token_ids = crt_tokens = get_batch_data('prompt_token_ids', batch)
+            generated_token_ids = None
+            crt_tokens = None
 
             for token_index in range(max_new_tokens):
                 if token_index == 0:
@@ -384,6 +385,7 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
                     pattern_matrices = all_pattern_matrices[:, :prompt_len, :, :] # (num_samples, prompt_len, 32, 8)
                     pattern_matrix = pattern_matrices.sum(0).sum(0) # (32, 8)
                     crt_tokens = all_token_ids[:, :prompt_len]
+                    generated_token_ids = crt_tokens
                     attention_mask = create_attention_mask(crt_tokens)
                 else:
                     # decoding
