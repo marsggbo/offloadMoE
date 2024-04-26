@@ -33,7 +33,7 @@ def prepare_data(dataset_list: Dict[str,int]):
     data = []
     # alpaca_data
     if 'alpaca' in dataset_list:
-        alpaca_data = load_json("/home/nus-hx/code/Sequence-Scheduling/data/alpaca-train-10k.json")
+        alpaca_data = load_json("/home/scratch.shunkangz_gpu/Research/NUS_Project/Sequence-Scheduling/data/alpaca-train-10k.json")
         num_samples = dataset_list['alpaca']
         for i in range(num_samples):
             data.append(alpaca_data[i]['conversations'][0]['value'])
@@ -90,7 +90,7 @@ def main():
         # 'yizhongw': 1000
     }
     print(f'Building dataset including {dataset_list}')
-    batch_size = 4
+    batch_size = 1
     data = prepare_data(dataset_list)
     # indices = list(range(len(data)))
     # np.random.shuffle(indices)
@@ -106,7 +106,7 @@ def main():
         device_map=device,
     )
     config.offload = True
-    config.num_hidden_layers = 1 # for debug only
+    # config.num_hidden_layers = 1 # for debug only
     model = build_offload_model(config)
     model = model.bfloat16()
     model = model.to(device)

@@ -7,10 +7,20 @@ import numpy as np
 from transformers import AutoConfig, AutoTokenizer
 from datasets import load_dataset
 from transformers import TextStreamer
+from torch.autograd import profiler as torch_profiler
 
 from hqq.core.quantize import BaseQuantizeConfig
 from offloadMoE.build_model import OffloadConfig, QuantConfig, build_model
 from offloadMoE.custom_layers import SparseMoeWrapper
+
+import torch.distributed as dist
+from accessory.util import misc
+import fairscale.nn.model_parallel.initialize as fs_init
+
+def init_env():
+    # define the model
+    misc.init_distributed_mode()
+    fs_init.initialize_model_parallel(dist.get_world_size())
 
 
 def load_json(file):
@@ -22,7 +32,7 @@ def prepare_data(dataset_list: Dict[str,int]):
     data = []
     # alpaca_data
     if 'alpaca' in dataset_list:
-        alpaca_data = load_json("/home/nus-hx/code/Sequence-Scheduling/data/alpaca-train-10k.json")
+        alpaca_data = load_json("/home/scratch.shunkangz_gpu/Research/NUS_Project/Sequence-Scheduling/data/alpaca-train-10k.json")
         num_samples = dataset_list['alpaca']
         for i in range(num_samples):
             data.append(alpaca_data[i]['conversations'][0]['value'])
@@ -64,6 +74,8 @@ def prepare_data(dataset_list: Dict[str,int]):
 
 
 def main():
+    # init_env()
+
     dataset_list = {
         'alpaca': 1000,
         # 'sst2': 1000,
@@ -82,7 +94,7 @@ def main():
     print(f'Building and Loading a MoE model...')
     model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
     quantized_model_name = "lavawolfiee/Mixtral-8x7B-Instruct-v0.1-offloading-demo"
-    state_path = "/home/nus-hx/code/offloadMoE/data"
+    state_path = "/home/scratch.shunkangz_gpu/Research/NUS_Project/Checkpoint/models--lavawolfiee--Mixtral-8x7B-Instruct-v0.1-offloading-demo/snapshots/3d47c8315811b9e0135d4fac21deb88309c6551c"
 
     config = AutoConfig.from_pretrained(quantized_model_name)
     device = torch.device("cuda:0")
@@ -138,36 +150,45 @@ def main():
         # 1: {},
         # ...
     }
+    compute_stream = torch.cuda.Stream()
     torch.cuda.synchronize()
     start = time.time()
-    for batch_idx, batch in enumerate(batches):
-        batch = batch.tolist()
-        data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
-        data = {key: val.to(device) for key, val in data.items()}
-        num_tokens.append(data['input_ids'].numel())
-        batch_start = time.time()
-        generated_token_ids = custom_generate(
-            data['input_ids'], data['attention_mask'], model, max_new_tokens=128, predictor=None
-        )
-        batch_end = time.time()
-        token_pattern_matrices_list = []
-        for layer in model.modules():
-            if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
-                token_pattern_matrices_list.append(layer.token_pattern_mask) # (bs, seq_len, num_experts)
-        token_pattern_matrices_list = torch.stack(token_pattern_matrices_list, dim=-1) # (bs, seq_len, num_layers, num_experts)
-        for i, text in enumerate(batch):
-            activations_record[len(batch)*batch_idx+i] = {
-                'prompt_text': text,
-                'prompt_token_ids': data['input_ids'][i].cpu(),
-                'token_ids': generated_token_ids[i].detach().cpu(),
-                'token_pattern_matrices': token_pattern_matrices_list[i]
-            }
-        for layer in model.modules():
-            if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
-                layer.token_pattern_mask = None
-        # print(tokenizer.batch_decode(result.cpu().numpy().tolist(), skip_special_tokens=True))
-        print(f"Processing batch {batch_idx} data.input_ids.shape={data['input_ids'].shape} time costs: {batch_end-batch_start:.4f}s")
+    torch.cuda.cudart().cudaProfilerStart()
+    with torch_profiler.emit_nvtx(record_shapes=True):
+        for batch_idx, batch in enumerate(batches):
+            torch.cuda.nvtx.range_push(f'Batch {batch_idx}')
+            batch = batch.tolist()
+            data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
+            data = {key: val.to(device) for key, val in data.items()}
+            num_tokens.append(data['input_ids'].numel())
+            batch_start = time.time()
+            with torch.cuda.stream(compute_stream):
+                generated_token_ids = custom_generate(
+                    data['input_ids'], data['attention_mask'], model, max_new_tokens=3, predictor=None
+                )
+            batch_end = time.time()
+            token_pattern_matrices_list = []
+            for layer in model.modules():
+                if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
+                    token_pattern_matrices_list.append(layer.token_pattern_mask) # (bs, seq_len, num_experts)
+            token_pattern_matrices_list = torch.stack(token_pattern_matrices_list, dim=-1) # (bs, seq_len, num_layers, num_experts)
+            for i, text in enumerate(batch):
+                activations_record[len(batch)*batch_idx+i] = {
+                    'prompt_text': text,
+                    'prompt_token_ids': data['input_ids'][i].cpu(),
+                    'token_ids': generated_token_ids[i].detach().cpu(),
+                    'token_pattern_matrices': token_pattern_matrices_list[i]
+                }
+            for layer in model.modules():
+                if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
+                    layer.token_pattern_mask = None
+            # print(tokenizer.batch_decode(result.cpu().numpy().tolist(), skip_special_tokens=True))
+            print(f"Processing batch {batch_idx} data.input_ids.shape={data['input_ids'].shape} time costs: {batch_end-batch_start:.4f}s")
+            torch.cuda.nvtx.range_pop()
+            if batch_idx == 1:
+                break
     torch.cuda.synchronize()
+    torch.cuda.cudart().cudaProfilerStop()
     end = time.time()
     torch.save(activations_record, 'activations_record.pt')
     total_num_tokens = np.sum(num_tokens)

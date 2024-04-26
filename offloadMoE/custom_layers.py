@@ -257,7 +257,7 @@ class MixtralBLockSparseTop2MLP_HQQ(nn.Module):
 
 
 class SparseMoeWrapper(nn.Module):
-    def __init__(self, config, layer_id, gate, expert_cache):
+    def __init__(self, config, layer_id, gate, expert_cache, compute_stream):
         super().__init__()
 
         self.hidden_dim = config.hidden_size
@@ -269,8 +269,10 @@ class SparseMoeWrapper(nn.Module):
         self.gate = gate
         self.experts = expert_cache
         self.token_pattern_mask = None
+        self.compute_stream = compute_stream
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # with torch.cuda.stream(self.compute_stream):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (batch * sequence_length, n_experts)
@@ -299,23 +301,23 @@ class SparseMoeWrapper(nn.Module):
         active_experts = selected_experts.flatten().unique().tolist()
 
         # Loop over all available experts in the model and perform the computation on each expert
-        for (_layer_index, expert_idx), expert_layer in self.experts.load_experts(
+        for (_layer_index, expert_idx), expert_layer in self.experts.load_experts_overlap(
                 *((self.layer_id, expert_idx) for expert_idx in active_experts), unordered=True):
-            idx, top_x = torch.where(expert_mask[expert_idx])
-            assert top_x.shape[0] > 0
+                idx, top_x = torch.where(expert_mask[expert_idx])
+                assert top_x.shape[0] > 0
 
-            # in torch it is faster to index using lists than torch tensors
-            top_x_list = top_x.tolist()
-            idx_list = idx.tolist()
+                # in torch it is faster to index using lists than torch tensors
+                top_x_list = top_x.tolist()
+                idx_list = idx.tolist()
 
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
+                # Index the correct hidden states and compute the expert hidden state for
+                # the current expert. We need to make sure to multiply the output hidden
+                # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
+                current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+                current_hidden_states = expert_layer(current_state) * routing_weights[top_x_list, idx_list, None]
 
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
+                # However `index_add_` only support torch tensors for indexing so we'll use
+                # the `top_x` tensor here.
+                final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits

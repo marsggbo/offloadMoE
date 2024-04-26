@@ -9,6 +9,7 @@ from torch import nn
 
 from transformers import AutoConfig
 from transformers.models.mixtral import MixtralForCausalLM, MixtralConfig
+from transformers.models.mixtral.modeling_mixtral import MixtralAttention, MixtralDecoderLayer
 
 from safetensors.torch import load_file
 
@@ -162,6 +163,11 @@ def load_00_expert_state_dict(states_dir: str, device: torch.device):
         state_fpath = json.load(f)["weight_map"][f"{module_idx}.w1.W_q"]
     return load_file(os.path.join(states_dir, state_fpath), device=str(device))
 
+def forward_pre_hook(module, input):
+    torch.cuda.nvtx.range_push(f"Layer {module.__class__.__name__}")
+
+def forward_post_hook(module, input, output):
+    torch.cuda.nvtx.range_pop()
 
 def build_model(
     device: torch.device,
@@ -207,6 +213,8 @@ def build_model(
         offload_size=offload_config.offload_size,
         buffer_size=offload_config.buffer_size,
     )
+
+    compute_stream = torch.cuda.Stream()
     for layer_idx in trange(model_config.num_hidden_layers, desc="Loading experts"):
         curr_layer = model.model.layers[layer_idx]
         curr_layer.block_sparse_moe = SparseMoeWrapper(
@@ -214,6 +222,7 @@ def build_model(
             layer_idx,
             curr_layer.block_sparse_moe.gate,
             expert_cache,
+            compute_stream
         )
 
         for expert_idx in range(model_config.num_local_experts):
@@ -238,4 +247,10 @@ def build_model(
             torch.cuda.synchronize(device)
             torch.cuda.empty_cache()
 
+    #### Add nvtx hook ####
+    for module in model.modules():
+        if isinstance(module, SparseMoeWrapper) or isinstance(module, MixtralAttention) or isinstance(module, MixtralDecoderLayer):
+            module.register_forward_pre_hook(forward_pre_hook)
+            module.register_forward_hook(forward_post_hook)
+        
     return model

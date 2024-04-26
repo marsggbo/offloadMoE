@@ -74,6 +74,9 @@ class ExpertCache:
             torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(buffer_size)])
         self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(EvictionGroupInfo)
 
+        self.H2D_stream = torch.cuda.Stream()
+        self.D2H_stream = torch.cuda.Stream()
+
     def _check_module(self, module: MixtralExpertWrapper):
         assert isinstance(module.storage, torch.UntypedStorage)
         if self.module_type is None:
@@ -116,6 +119,54 @@ class ExpertCache:
                     self.group_infos[eviction_group].add(info)
                     return  # done allocating; found an offloaded spot
         raise ValueError("Cache is full")
+
+    def load_experts_overlap(self, *uids, unordered = False):
+        if unordered:
+            uids = sorted(uids, key=lambda uid: self.registered_experts[uid].offloaded)
+        infos = [self.registered_experts[uid] for uid in uids]
+
+        eviction_group = self.group_infos[infos[0].eviction_group]
+        for info in infos:
+            eviction_group.mark_used(info)
+        
+        # Case1: All experts in device are active
+        # Case2: Part of experts in device are active
+        # Case3: None of experts in device is active
+        active_experts = deque()
+        active_experts_idx = deque()
+        copy_idx = 0
+        for i in range(len(infos)):
+            if infos[i].offloaded == True:
+                copy_idx = i
+                break
+            else:
+                active_experts.append(self.main_modules[infos[i].index])
+                active_experts_idx.append(infos[i].uid)
+
+        # If there is no active expert
+        if len(active_experts) == 0:
+            assert copy_idx == 0, "We should copy the expert from the beginning"
+            expert_in_copy = self._swap(infos[copy_idx], eviction_group.choose_expert_to_evict())
+            active_experts.append(expert_in_copy)
+            active_experts_idx.append(infos[copy_idx].uid)
+            copy_idx += 1
+        
+        while len(active_experts) != 0:
+            # Wait the previous copy finish
+            # torch.cuda.current_stream().wait_stream(self.D2H_stream)
+            # torch.cuda.current_stream().wait_stream(self.H2D_stream)
+            self.D2H_stream.synchronize()
+            self.H2D_stream.synchronize()
+
+            # Start the copy of next expert
+            if copy_idx < len(infos) and copy_idx != 0:
+                expert_in_copy = self._swap(infos[copy_idx], eviction_group.choose_expert_to_evict())
+                active_experts.append(expert_in_copy)
+                active_experts_idx.append(infos[copy_idx].uid)
+                copy_idx += 1
+
+            # Return the loaded expert
+            yield(active_experts_idx.popleft(), active_experts.popleft())
 
     def load_experts(
             self, *uids: ExpertUID, unordered: bool = False) -> Iterator[Tuple[ExpertUID, MixtralExpertWrapper]]:
@@ -180,13 +231,19 @@ class ExpertCache:
 
     def _swap(self, info_to_load: ExpertInfo, info_to_evict: ExpertInfo) -> nn.Module:
         """Swap an offloaded expert (info_to_load) with an on-device expert (info_to_evict) return the loaded expert"""
+        # print("To load ", info_to_load.offloaded)
+        # print("To evict ", info_to_evict.offloaded)
         assert info_to_load.offloaded and not info_to_evict.offloaded
         assert info_to_load.eviction_group == info_to_evict.eviction_group
         # swap a single on-device expert with a single offloaded expert using buffers for parallelism
         offloaded_storage_buffer = self.offloaded_storage_buffers.popleft()
         device_expert_buffer = self.device_expert_buffers.popleft()
-        device_expert_buffer.storage.copy_(self.offloaded_storages[info_to_load.index], non_blocking=True)
-        offloaded_storage_buffer.copy_(self.main_modules[info_to_evict.index].storage, non_blocking=True)
+        
+        with torch.cuda.stream(self.H2D_stream):
+            device_expert_buffer.storage.copy_(self.offloaded_storages[info_to_load.index], non_blocking=True)
+
+        with torch.cuda.stream(self.D2H_stream):
+            offloaded_storage_buffer.copy_(self.main_modules[info_to_evict.index].storage, non_blocking=True)
 
         self.device_expert_buffers.append(self.main_modules[info_to_evict.index])
         self.main_modules[info_to_evict.index] = device_expert_buffer
@@ -198,6 +255,7 @@ class ExpertCache:
         info_to_evict.offloaded, info_to_load.offloaded = info_to_load.offloaded, info_to_evict.offloaded
         info_to_evict.index, info_to_load.index = info_to_load.index, info_to_evict.index
         self.group_infos[info_to_load.eviction_group].swap(info_to_load, info_to_evict)
+
         return device_expert_buffer
 
     def prefetch(

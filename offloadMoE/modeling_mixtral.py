@@ -960,6 +960,7 @@ class MixtralDecoderLayer(nn.Module):
                 (see `past_key_values`).
         """
 
+        torch.cuda.nvtx.range_push("Attention")
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -978,10 +979,14 @@ class MixtralDecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("MoE")
         hidden_states, router_logits = self.block_sparse_moe(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
+        torch.cuda.nvtx.range_pop()
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -1243,7 +1248,10 @@ class MixtralModel(MixtralPreTrainedModel):
         all_router_logits = () if output_router_logits else None
         next_decoder_cache = None
 
+        print("Number of decoder layer ", len(self.layers))
+        layer_id = 0
         for decoder_layer in self.layers:
+            torch.cuda.nvtx.range_push(f'Layer {layer_id}')
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1270,6 +1278,9 @@ class MixtralModel(MixtralPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
+
+            torch.cuda.nvtx.range_pop()
+            layer_id += 1
 
             if use_cache:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
@@ -1884,10 +1895,10 @@ def build_offload_model(config=None):
             device_map=device,
         )
         config.offload = True
-      
-    config.num_hidden_layers = 1
-    state_path = '/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/1e637f2d7cb0a9d6fb1922f305cb784995190a83'
-    state_dict_00 = load_00_expert_state_dict(state_path, device)
+    
+    # config.num_hidden_layers = 1
+    state_path = '/home/scratch.shunkangz_gpu/Research/NUS_Project/Checkpoint/models--mistralai--Mixtral-8x7B-v0.1/snapshots/985aa055896a8f943d4a9f2572e6ea1341823841'
+    # state_dict_00 = load_00_expert_state_dict(state_path, device)
     ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
     offload_per_layer = 4
     # offload_per_layer = 5
