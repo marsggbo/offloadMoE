@@ -300,15 +300,24 @@ class SparseMoeWrapper(nn.Module):
 
         active_experts = selected_experts.flatten().unique().tolist()
 
+        # Precalculate the idx
+        idx_topx_list = {}
+        for expert_idx in active_experts:
+            idx_topx_list[expert_idx] = torch.where(expert_mask[expert_idx])
+
         # Loop over all available experts in the model and perform the computation on each expert
         for (_layer_index, expert_idx), expert_layer in self.experts.load_experts_overlap(
                 *((self.layer_id, expert_idx) for expert_idx in active_experts), unordered=True):
-                idx, top_x = torch.where(expert_mask[expert_idx])
-                assert top_x.shape[0] > 0
+                # idx, top_x = torch.where(expert_mask[expert_idx])
+                # idx, top_x = expert_mask[expert_idx].nonzero(as_tuple=True)
+                # assert top_x.shape[0] > 0
+                idx, top_x = idx_topx_list[expert_idx]
 
                 # in torch it is faster to index using lists than torch tensors
-                top_x_list = top_x.tolist()
-                idx_list = idx.tolist()
+                # top_x_list = top_x.tolist()
+                # idx_list = idx.tolist()
+                top_x_list = top_x
+                idx_list = idx
 
                 # Index the correct hidden states and compute the expert hidden state for
                 # the current expert. We need to make sure to multiply the output hidden
