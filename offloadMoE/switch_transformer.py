@@ -273,7 +273,7 @@ class SwitchTransformersDenseActDense(nn.Module):
     def forward(self, hidden_states):
         hidden_states = self.wi(hidden_states)
         hidden_states = self.act(hidden_states)
-        hidden_states = self.dropout(hidden_states)
+        # hidden_states = self.dropout(hidden_states)
         if (
             isinstance(self.wo.weight, torch.Tensor)
             and hidden_states.dtype != self.wo.weight.dtype
@@ -299,8 +299,11 @@ class SwitchTransformersSparseMLP(nn.Module):
         mp_rank = fs_init.get_model_parallel_rank()
         assert config.num_experts % mp_size == 0
         self.num_experts = config.num_experts
-        n_local_experts = config.num_experts // mp_size
-        self.local_experts = [str(i) for i in range(n_local_experts*mp_rank, n_local_experts*(mp_rank+1))]
+        if getattr(config, 'offload', False):
+            self.n_local_experts = 0
+        else:
+            self.n_local_experts = config.num_experts // mp_size
+        self.local_experts = [str(i) for i in range(self.n_local_experts*mp_rank, self.n_local_experts*(mp_rank+1))]
         self.experts = nn.ModuleDict()
         for idx in self.local_experts:
             self.experts[f"expert_{idx}"] = expert_class(config)
@@ -323,18 +326,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         # router_logits.shape is (batch, seq_len, num_experts), dtype is float
         router_mask, router_probs, router_logits = self.router(hidden_states)
         expert_index = torch.argmax(router_mask, dim=-1) # shape is (batch, seq_len), dtype is int64
-
-        # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
-        # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
-
-        # new
         next_states = torch.zeros_like(hidden_states)
-        # print("Hidden shape ", hidden_states.shape)
-        # print(" *********************** ")
-        # for i in range(self.num_experts):
-        #     token_indices = router_mask[:, :, i].bool()
-        #     num_select = torch.count_nonzero(token_indices)
-        #     print(f'Expert {i} Received Tokens {num_select}')
 
         for expert_idx, expert in self.experts.items():
             idx = int(expert_idx.split('_')[1])
@@ -344,20 +336,10 @@ class SwitchTransformersSparseMLP(nn.Module):
                 num_select_tokens = hidden_states.shape[0] // self.num_experts
                 token_indices[:num_select_tokens, :] = True
                 token_indices = token_indices.bool()
-                # print("Num select tokens ", num_select_tokens)
-                # print("Num select tokens ", torch.count_nonzero(token_indices))
-                # print("Next states ", next_states[token_indices].shape)
             if torch.any(token_indices):
-                next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype) * router_probs[token_indices]
+                expert_out = expert(hidden_states[token_indices]).to(next_states.dtype)
+                next_states[token_indices] = expert_out * router_probs[token_indices]
         hidden_states = reduce_from_model_parallel_region(next_states)
-
-        # # original
-        # next_states = hidden_states.clone()
-        # for idx, expert in enumerate(self.experts.values()):
-        #     token_indices = router_mask[:, :, idx].bool()
-        #     next_states[token_indices] = expert(hidden_states[token_indices]).to(next_states.dtype)
-        # hidden_states = router_probs * next_states
-
         return hidden_states, (router_logits, expert_index)
 
 
@@ -906,8 +888,11 @@ class SwitchTransformersPreTrainedModel(PreTrainedModel):
             module.router.classifier.weight.data.normal_(mean=0.0, std=factor * 1)
             mp_rank = fs_init.get_model_parallel_rank()
             mp_size = fs_init.get_model_parallel_world_size()
-            n_local_experts = self.config.num_experts // mp_size
-            local_experts = [str(i) for i in range(n_local_experts*mp_rank, n_local_experts*(mp_rank+1))]
+            if getattr(self.config, 'offload', False):
+                self.n_local_experts = 0
+            else:
+                self.n_local_experts = self.config.num_experts // mp_size
+            local_experts = [str(i) for i in range(self.n_local_experts*mp_rank, self.n_local_experts*(mp_rank+1))]
             for idx in local_experts:
                 module.experts[f"expert_{idx}"].wi.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
                 module.experts[f"expert_{idx}"].wo.weight.data.normal_(mean=0.0, std=factor * (d_model**-0.5))
@@ -1597,7 +1582,7 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        output_router_logits: Optional[bool] = True,
+        output_router_logits: Optional[bool] = False,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqMoEOutput]:
         r"""
@@ -1837,10 +1822,11 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
             reordered_decoder_past = reordered_decoder_past + (reordered_layer_past_states,)
         return reordered_decoder_past
 
-    def load_state_dict(self, state_dict_to_load):
+    def load_state_dict(self, state_dict_to_load, strict=True):
         mp_size = fs_init.get_model_parallel_world_size()
         if mp_size == 1:
-            super().load_state_dict(state_dict_to_load, strict=True)
+            super().load_state_dict(state_dict_to_load, strict=strict)
+            return
 
         # Todo: reproduce reults for tensor parallel case
         mp_rank = fs_init.get_model_parallel_rank()
@@ -1863,7 +1849,6 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
         for key, val in state_dict_to_load.items():
             if is_qkv_lm_head_module(key):
                 # shard output feature size
-                # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} val.data[{start_index}:{end_index}, :] {val.data.shape}")
                 output_feature_size = val.shape[0]
                 shard_size = output_feature_size // mp_size
                 start_index = mp_rank * shard_size
@@ -1875,16 +1860,13 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
                 shard_size = input_feature_size // mp_size
                 start_index = mp_rank * shard_size
                 end_index = start_index + shard_size
-                # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} val.data[:, {start_index}:{end_index}] {val.data.shape}")
                 self_state_dict[key].data.copy_(val.data[:, start_index:end_index])
             else:
                 if 'mlp.experts' in key:
                     expert_idx = int(key.split('mlp.experts.expert_')[1].split('.')[0])
                     if expert_idx in local_experts:
-                        # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} {val.data.shape}")
                         self_state_dict[key].data.copy_(val.data)
                 else:
-                    # print(f"Rank{rank}-{key} {self_state_dict[key].data.shape} {val.data.shape}")
                     self_state_dict[key].data.copy_(val.data)
 
 
@@ -2016,25 +1998,38 @@ def build_offload_model(config=None):
             'index_file': 'model.safetensors.index.json'
         },
     }
+    MODEL_STATE_DICT = None
 
-    class SwitchMoeWrapper(SparseMoeWrapper):
+    class SwitchMoeWrapper(nn.Module):
         def __init__(self, config, layer_id, gate, expert_cache):
             config.num_experts_per_tok = config.num_selected_experts
             config.intermediate_size = config.d_ff
             config.num_local_experts = config.num_experts
-            config.num_experts_per_tok = 1
             super().__init__()
-
             self.hidden_dim = config.hidden_size
             self.ffn_dim = config.intermediate_size
             self.num_experts = config.num_local_experts
             self.top_k = config.num_experts_per_tok
             self.layer_id = layer_id
-
-            self.gate = gate
+            self.router = gate
             self.experts = expert_cache
             self.token_pattern_mask = None
-            
+    
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            router_mask, router_probs, router_logits = self.router(hidden_states)
+            expert_index = torch.argmax(router_mask, dim=-1) # shape is (batch, seq_len), dtype is int64
+            active_experts = expert_index.flatten().unique().tolist()
+            next_states = torch.zeros_like(hidden_states)
+            for (_layer_index, expert_idx), expert_layer in self.experts.load_experts(
+                *((self.layer_id, expert_idx) for expert_idx in active_experts), unordered=True):
+                token_indices = router_mask[:, :, expert_idx].bool()
+                if torch.any(token_indices):
+                    expert_out = expert_layer(hidden_states[token_indices]).to(next_states.dtype)
+                    next_states[token_indices] = expert_out * router_probs[token_indices]
+            hidden_states = reduce_from_model_parallel_region(next_states)
+            return hidden_states, (router_logits, expert_index)
+
+        
     class SwitchExpertWrapper(nn.Module):
         def __init__(
             self,
@@ -2134,10 +2129,13 @@ def build_offload_model(config=None):
         expert_prefix: str, # 'encoder' or 'decoder
         expert_uid: tuple[int, int],
         device: torch.device,
-        pretrained_weights_map: dict=pretrained_weights_map,
+        base_layer_idx: int,
+        pretrained_weights_map: dict=pretrained_weights_map
     ) -> SwitchExpertWrapper:
         assert expert_prefix in ['encoder', 'decoder']
         layer_idx, expert_idx = expert_uid
+        if expert_prefix == 'decoder':
+            layer_idx -= base_layer_idx
         sub_layer_id = 1 if expert_prefix=='encoder' else 2
 
         weight_info = pretrained_weights_map[config._name_or_path]
@@ -2151,8 +2149,9 @@ def build_offload_model(config=None):
             index_path = glob(f"{states_dir}/{weight_index_file}")[0]
         else:
             index_path = None
-        module_idx = f"{expert_prefix}.block.{layer_idx}.layer.{sub_layer_id}.experts.expert_{expert_idx}"
+        module_idx = f"{expert_prefix}.block.{layer_idx}.layer.{sub_layer_id}.mlp.experts.expert_{expert_idx}"
         if index_path is not None:
+            # 多文件权重
             with open(index_path) as f:
                 # example: encoder.block.1.layer.1.mlp.experts.expert_0.wi.weight
                 # example: encoder.block.1.layer.1.mlp.experts.expert_0.wo.weight
@@ -2161,18 +2160,27 @@ def build_offload_model(config=None):
                 weight_map = json.load(f)["weight_map"]
                 state_fpaths = [weight_map[f"{module_idx}.w{i}.weight"] for i in ['i', 'o']]
                 state_fpaths = list(set(state_fpaths))
+            for state_fpath in state_fpaths:
+                state_dict = weight_load_func(os.path.join(states_dir, state_fpath), device)
+                expert = make_empty_expert(config).bfloat16()
+                for idx in ['i', 'o']:
+                    layer = getattr(expert, f"w{idx}")
+                    w_to_load = state_dict[f'{module_idx}.w{idx}.weight']
+                    layer.weight.data.copy_(w_to_load)
         else:
+            # 单文件权重
             if weight_file_type == 'bin':
                 state_fpaths = glob(f"{states_dir}/pytorch_model.bin")
             else:
                 state_fpaths = glob(f"{states_dir}/*.safetensors")
             assert len(state_fpaths)==1
-        for state_fpath in state_fpaths:
-            state_dict = weight_load_func(os.path.join(states_dir, state_fpath), device)
+            nonlocal MODEL_STATE_DICT
+            if MODEL_STATE_DICT is None:
+                MODEL_STATE_DICT = weight_load_func(state_fpaths[0], device)
             expert = make_empty_expert(config).bfloat16()
             for idx in ['i', 'o']:
                 layer = getattr(expert, f"w{idx}")
-                w_to_load = state_dict[f'{module_idx}.w{idx}.weight']
+                w_to_load = MODEL_STATE_DICT[f'{module_idx}.w{idx}.weight']
                 layer.weight.data.copy_(w_to_load)
         return SwitchExpertWrapper(expert, device)
 
@@ -2181,23 +2189,25 @@ def build_offload_model(config=None):
     if config is None:
         config = AutoConfig.from_pretrained(
             model_name,
-            num_local_experts=8,
+            # num_experts=16,
             torch_dtype=torch.bfloat16,
             device_map=device,
         )
         config.offload = True
       
-    config.num_hidden_layers = 1
+    # config.num_hidden_layers = 2
+    # config.num_decoder_layers = 2
     state_path = '/home/nus-hx/.cache/huggingface/hub/models--google--switch-base-16/snapshots/0ef7d88ed50ec5f2cfdc019e81cef04d19700f8f'
     ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
     offload_per_layer = 12
     # offload_per_layer = 5
     ###############################################################
 
-    num_experts = config.num_local_experts
+    num_experts = config.num_experts
+    num_expert_layers = config.num_hidden_layers//config.encoder_sparse_step+config.num_decoder_layers//config.decoder_sparse_step
     offload_config = OffloadConfig(
-        main_size=config.num_hidden_layers * (num_experts - offload_per_layer),
-        offload_size=config.num_hidden_layers * offload_per_layer,
+        main_size=num_expert_layers * (num_experts - offload_per_layer),
+        offload_size=num_expert_layers * offload_per_layer,
         buffer_size=4,
         offload_per_layer=offload_per_layer,
     )
@@ -2217,36 +2227,54 @@ def build_offload_model(config=None):
         offload_size=offload_config.offload_size,
         buffer_size=offload_config.buffer_size,
     )
-    for layer_idx in range(model_config.num_hidden_layers):
-        curr_layer = model.model.layers[layer_idx]
-        curr_layer.block_sparse_moe = SwitchMoeWrapper(
-            model_config,
-            layer_idx,
-            curr_layer.block_sparse_moe.gate,
-            expert_cache,
-        )
-
-        for expert_idx in range(model_config.num_local_experts):
-            do_offload = expert_idx < offload_config.offload_per_layer
-
-            expert_wrapper = make_and_load_expert_wrapper(
+    for block_type in ['encoder', 'decoder']:
+        if block_type == 'encoder':
+            num_block_layers = model_config.num_layers
+            sparse_step = model_config.encoder_sparse_step
+            block_inner_layer_id = 1
+            base_layer_idx = 0
+        else:
+            num_block_layers = model_config.num_decoder_layers
+            sparse_step = model_config.decoder_sparse_step
+            block_inner_layer_id = 2
+            base_layer_idx = model_config.num_layers
+        for block_idx in list(range(num_block_layers))[1:][::sparse_step]:
+            curr_layer = getattr(model, block_type).block[block_idx].layer[block_inner_layer_id]
+            curr_layer.mlp = SwitchMoeWrapper(
                 config=model_config,
-                states_dir=state_path,
-                expert_uid=(layer_idx, expert_idx),
-                device=device,
+                layer_id=block_idx+base_layer_idx,
+                gate=curr_layer.mlp.router,
+                expert_cache=expert_cache,
             )
 
-            expert_cache.add_expert(
-                uid=(layer_idx, expert_idx),
-                module=expert_wrapper,
-                eviction_group=layer_idx,
-                offload=do_offload,
-            )
+            for expert_idx in range(model_config.num_experts):
+                do_offload = expert_idx < offload_config.offload_per_layer
 
-            del expert_wrapper
-            torch.cuda.synchronize(device)
-            torch.cuda.empty_cache()
-    print(model)
+                expert_wrapper = make_and_load_expert_wrapper(
+                    config=model_config,
+                    states_dir=state_path,
+                    expert_prefix=block_type,
+                    expert_uid=(base_layer_idx+block_idx, expert_idx),
+                    base_layer_idx=base_layer_idx,
+                    device=device,
+                )
+
+                expert_cache.add_expert(
+                    uid=(base_layer_idx+block_idx, expert_idx),
+                    module=expert_wrapper,
+                    eviction_group=base_layer_idx+block_idx,
+                    offload=do_offload,
+                )
+
+                del expert_wrapper
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()
+    if MODEL_STATE_DICT is not None:
+        non_expert_dict = {}
+        for key, val in MODEL_STATE_DICT.items():
+            if 'expert' not in key:
+                non_expert_dict[key] = val
+        model.load_state_dict(non_expert_dict, True)
     return model
 
 
@@ -2268,39 +2296,126 @@ if __name__ == '__main__':
 
     init_env()
     rank = dist.get_rank()
-    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-16")
-    config = SwitchTransformersConfig.from_pretrained("google/switch-base-16")
+    device = f"cuda:{rank}" if torch.cuda.is_available() else 'cpu'
+    x = torch.randint(0,100,(2,10)).to(device)
+    attention_mask = torch.ones(2,10).to(device)
+    decoder_input_ids=torch.tensor([[0]]*len(x)).int().to(device)
+    
+    ############################################
+    # offload Switch-transformer
+    ############################################
+    offload_model = build_offload_model()
+    offload_model = offload_model.bfloat16()
+    offload_model = offload_model.to(device)
+    offload_model = offload_model.eval()
 
-    model = SwitchTransformersForConditionalGeneration(config)
-    model = model.bfloat16()
-    model.eval()
+    ############################################
+    # normal Switch-transformer
+    ############################################
+    config = SwitchTransformersConfig.from_pretrained("google/switch-base-16")
+    full_model = SwitchTransformersForConditionalGeneration(config)
+    full_model = full_model.bfloat16()
+    full_model = full_model.to(rank)
+    full_model = full_model.eval()
+    num_experts = 16
+    ckpt_file = glob(f'/home/nus-hx/.cache/huggingface/hub/models--google--switch-base-16/snapshots/0ef7d88ed50ec5f2cfdc019e81cef04d19700f8f/pytorch_model.bin')[0]
+    ckpt = torch.load(ckpt_file, map_location='cpu')
+    full_model.load_state_dict(ckpt)
+
+    def is_weights_matched(offload_model, full_model):
+        # non_experts part
+        flag = True
+        full_model_state = full_model.state_dict()
+        num_key1 = 0
+        num_key_mismatched1 = 0
+        for key, val in offload_model.state_dict().items():
+            num_key1 += 1
+            if ('expert' not in key) and (not torch.all(val==full_model_state[key])):
+                print(f"Non-expert: {key} not equal")
+                num_key_mismatched1 += 1
+                flag = False
+        
+        num_key2 = 0
+        num_key_mismatched2 = 0
+        expert_cache = offload_model.encoder.block[1].layer[1].mlp.experts
+        activated_experts, activated_infos = expert_cache.main_modules, expert_cache.main_infos
+        offloaded_experts, offloaded_infos = expert_cache.offloaded_storages, expert_cache.offloaded_infos
+        for idx, info in enumerate(activated_infos):
+            expert = activated_experts[idx]
+            (layer_id, expert_id) = info.uid
+            block_type = 'encoder'
+            expert_layer = 1
+            if layer_id > 11:
+                layer_id -= 12
+                block_type = 'decoder'
+                expert_layer = 2
+            for w_name in ['wi', 'wo']:
+                param = getattr(expert.expert_module, w_name).weight
+                full_expert = getattr(full_model, block_type).block[layer_id].layer[expert_layer].mlp.experts[f"expert_{expert_id}"]
+                full_param = getattr(full_expert, w_name).weight
+                num_key2 += 1
+                if not torch.all(param==full_param):
+                    num_key_mismatched2 += 1
+                    print('Activated Experts', block_type, layer_id, expert_id, w_name)
+                    flag = False
+
+        num_key3 = 0
+        num_key_mismatched3 = 0
+        for idx, info in enumerate(offloaded_infos):
+            storage = offloaded_experts[idx]
+            (layer_id, expert_id) = info.uid
+            block_type = 'encoder'
+            expert_layer = 1
+            if layer_id > 11:
+                layer_id -= 12
+                block_type = 'decoder'
+                expert_layer = 2
+            start_idx = 0
+            for w_name in ['wi', 'wo']:
+                num_key3 += 1
+                full_expert = getattr(full_model, block_type).block[layer_id].layer[expert_layer].mlp.experts[f"expert_{expert_id}"]
+                full_param = getattr(full_expert, w_name).weight.view(-1)
+                len_full_param = len(full_param)
+                end_idx = start_idx + len_full_param
+                off_param = torch.as_tensor(storage, dtype=full_param.dtype, device=full_param.device)
+                if not torch.all(off_param[start_idx:end_idx]==full_param):
+                    num_key_mismatched3 += 1
+                    print('Offloaded Experts', block_type, layer_id, expert_id, w_name)
+                    flag = False
+                start_idx = len_full_param
+        print(f"{num_key1+num_key2+num_key3} modules' weights matched?", flag)
+        if not flag:
+            print(f"#Mismatched keys={num_key_mismatched1+num_key_mismatched2+num_key_mismatched3}")
+        return flag
+    flag = is_weights_matched(offload_model, full_model)
+
+    with torch.inference_mode():
+        outputs1 = offload_model(input_ids=x, decoder_input_ids=decoder_input_ids, attention_mask=attention_mask)
+        print(outputs1.logits.shape)
+        print('\n\n\nStart Full')
+        outputs2 = full_model(input_ids=x, decoder_input_ids=decoder_input_ids, attention_mask=attention_mask)
+        print(outputs2.logits.shape)
+        print(torch.all(outputs1[0]==outputs2[0]))
+    
+    model = offload_model
+    # model = full_model
+    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-16")
+    tokenizer.padding_side = 'left'
     input_ids = tokenizer(
         [
             # "summarize: studies have shown that owning a dog is good for you",
-            # "tell me a joke",
+            "translate: tell me a joke",
             "summarize: As a cache eviction algorithm, FIFO has a lot of attractive properties, such as simplicity, speed, scalability, and flash-friendliness. The most prominent criticism of FIFO is its low efficiency (high miss ratio). In this work, we demonstrate a simple, scalable FIFObased algorithm with three static queues (S3-FIFO). Evaluated on 6594 cache traces from 14 datasets, we show that S3- FIFO has lower miss ratios than state-of-the-art algorithms across traces. Moreover, S3-FIFO’s efficiency is robust — it has the lowest mean miss ratio on 10 of the 14 datasets. FIFO queues enable S3-FIFO to achieve good scalability with 6× higherthroughput compared to optimized LRU at 16 threads. Our insight is that most objects in skewed workloads will only be accessed once in a short window, so it is critical to evict them early (also called quick demotion). The key of S3-FIFO is a small FIFO queue that filters out most objects from entering the main cache, which provides a guaranteed demotion speed and high demotion precision."
         ], return_tensors="pt", padding=True
     ).input_ids.to(rank)  # Batch size 1
 
-    num_experts = 16
-    ckpt_file = glob(f'/lustre/fsw/portfolios/coreai/users/shunkangz/NUS-Project/LLaMA2-Accessory/switch_ckpt/models--google--switch-base-{num_experts}/snapshots/*/pytorch_model.bin')[0]
-    ckpt = torch.load(ckpt_file, map_location='cpu')
-    model.load_state_dict(ckpt)
-
-    # from transformers import SwitchTransformersForConditionalGeneration as HFSwitch
-    # hf_model = HFSwitch.from_pretrained("google/switch-base-8").to(rank)
-    # outputs = hf_model.generate(input_ids, max_new_tokens=200, do_sample=True)
-    # model.load_state_dict(hf_model.state_dict())
-    # print(tokenizer.decode(outputs[0]))
-
-    model = model.to(rank)
     for i in range(10):
         do_sample = i > -1
-        outputs = model.generate(input_ids, max_new_tokens=200, do_sample=do_sample, temperature=0.8, top_k=100)
+        outputs = model.generate(input_ids, max_new_tokens=200, do_sample=do_sample, temperature=0.5, top_k=100)
         print(tokenizer.decode(outputs[0]))
 
         # decoder_input_ids=torch.tensor([[0]]*len(input_ids)).int().to(rank)
         # outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
         # print(outputs.logits.shape, outputs.logits[0,:20])
 
-# torchrun --nproc-per-node=8 --master-port=6869 switch_transformer.py
+# # torchrun --master-port=6869 --nproc-per-node=1 switch_transformer.py

@@ -108,7 +108,7 @@ def prepare_model(device):
 
 def main(args):
     dataset_list = {
-        'alpaca': 8,
+        'alpaca': 16,
         # 'sst2': 1000,
         # 'mrpc': 1000,
         # 'tick666-math': 1000,
@@ -167,7 +167,9 @@ def run_benchmark(model, tokenizer, batches, max_new_tokens, device):
             data['input_ids'], data['attention_mask'], model, max_new_tokens=max_new_tokens, predictor=None
         )
         batch_end = time.time()
-        print(f"Processing batch {batch_idx} generated_token_ids.shape={generated_token_ids.shape} time costs: {batch_end-batch_start:.4f}s")
+        # for i in range(len(generated_token_ids)):
+        #     print(tokenizer.decode(generated_token_ids[i], skip_special_token=True))
+        # print(f"Processing batch {batch_idx} generated_token_ids.shape={generated_token_ids.shape} time costs: {batch_end-batch_start:.4f}s")
     torch.cuda.synchronize()
     end = time.time()
     total_num_tokens = np.sum(num_tokens)
@@ -343,6 +345,7 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
     def prefetch_experts_by_pattern_matrices(model, pattern_matrix):
         for i, layer in enumerate(model.model.layers):
             layer.block_sparse_moe.experts.prefetch(pattern_matrix)
+            break
 
     get_batch_data = lambda key, batch: torch.stack([batch[i][key] for i in range(len(batch))], dim=0)
 

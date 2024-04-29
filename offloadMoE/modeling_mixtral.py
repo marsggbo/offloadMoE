@@ -857,9 +857,9 @@ class MixtralSparseMoeBlock(nn.Module):
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
         if getattr(config, 'offload', False):
-            n_local_experts = config.num_local_experts // self.mp_size
-        else:
             n_local_experts = 0
+        else:
+            n_local_experts = config.num_local_experts // self.mp_size
         self.local_expert_indices = [i for i in range(
             n_local_experts*self.mp_rank, n_local_experts*(self.mp_rank+1))]
 
@@ -1571,9 +1571,10 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
                     local_ckpt[key] = val
         super().load_state_dict(local_ckpt, strict=True)
         
-    def load_state_dict(self, state_dict_to_load):
+    def load_state_dict(self, state_dict_to_load, strict=True):
         if self.mp_size == 1:
-            super().load_state_dict(state_dict_to_load, strict=True)
+            super().load_state_dict(state_dict_to_load, strict=strict)
+            return
 
         # Todo: reproduce reults for tensor parallel case
         n_local_experts = self.num_experts // self.mp_size

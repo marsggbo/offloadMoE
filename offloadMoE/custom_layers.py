@@ -283,10 +283,9 @@ class SparseMoeWrapper(nn.Module):
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        new_token_pattern_mask = torch.zeros(batch_size, sequence_length, self.num_experts).scatter_(
-                -1, selected_experts.view(batch_size, sequence_length, 2).cpu(), 1)
-        
         if os.environ.get('TRACE_PATTERN', False):
+            new_token_pattern_mask = torch.zeros(batch_size, sequence_length, self.num_experts).scatter_(
+                -1, selected_experts.view(batch_size, sequence_length, self.top_k).cpu(), 1)
             if self.token_pattern_mask is None:
                 self.token_pattern_mask = new_token_pattern_mask
             else:
