@@ -53,7 +53,7 @@ class EvictionGroupInfo:
 
 
 class ExpertCache:
-    def __init__(self, make_module: callable, main_size: int, offload_size: int, buffer_size: int):
+    def __init__(self, make_module: callable, num_layer: int, main_size: int, offload_size: int, buffer_size: int):
         """Dynamically loads an array of modules with identical hyperparameters"""
         self.module_type = self.module_size = self.device = None
         self.active = False
@@ -69,10 +69,18 @@ class ExpertCache:
         self.offloaded_infos: List[Optional[ExpertInfo]] = [None for _ in range(offload_size)]
 
         # temporary storage to shave off latency
-        self.device_expert_buffers = deque([self._check_module(make_module()) for _ in range(buffer_size)])
-        self.offloaded_storage_buffers = deque([
-            torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(buffer_size)])
+        self.device_expert_buffers = [deque([self._check_module(make_module()) for _ in range(buffer_size)]), 
+                                    deque([self._check_module(make_module()) for _ in range(buffer_size)])]
+        self.offloaded_storage_buffers = [deque([torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(buffer_size)]),
+                                          deque([torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(buffer_size)])]
         self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(EvictionGroupInfo)
+        
+        self.buffer_id = 0
+        self.num_layer = num_layer
+
+        # Store the active experts
+        self.active_experts = [deque(), deque()]
+        self.active_experts_idx = [deque(), deque()]
 
         self.H2D_stream = torch.cuda.Stream()
         self.D2H_stream = torch.cuda.Stream()
@@ -119,6 +127,74 @@ class ExpertCache:
                     self.group_infos[eviction_group].add(info)
                     return  # done allocating; found an offloaded spot
         raise ValueError("Cache is full")
+
+    def set_pattern(self, pattern):
+        # Batch, Seq, 32, 8
+        self.pattern = pattern
+
+    # Load experts in the first layer
+    def load_first_layer(self):
+        # Get expert info in sorted order [non-offloaded, offloaded]
+        active_expert_id = self.pattern[0].nonzero().flatten().tolist()
+        expert_id = [(0, expert_idx) for expert_idx in active_expert_id]
+        expert_id = sorted(expert_id, key=lambda uid: self.registered_experts[uid].offloaded)
+        expert_info = [self.registered_experts[id] for id in expert_id]
+        
+        # Update eviction group info
+        eviction_group = self.group_infos[expert_info[0].eviction_group]
+        for info in expert_info:
+            eviction_group.mark_used(info)
+        
+        copy_idx = 0
+        for i in range(len(expert_info)):
+            if expert_info[i].offloaded == True:
+                copy_idx = i
+                break
+            else:
+                self.active_experts[self.buffer_id].append(self.main_modules[expert_info[i].index])
+                self.active_experts_idx[self.buffer_id].append(expert_info[i].uid)
+
+        while copy_idx < len(expert_info):
+            self.active_experts[self.buffer_id].append(self.swap_double_buffer(expert_info[copy_idx], eviction_group.choose_expert_to_evict(), self.buffer_id))
+            self.active_experts_idx[self.buffer_id].append(expert_info[copy_idx].uid)
+            copy_idx += 1
+
+    # Currently, we assume that all layers are accurate predictible
+    def load_next_layer_expert(self, *uids, layer_id):
+        self.D2H_stream.synchronize()
+        self.H2D_stream.synchronize()
+
+        # Last layer does not prefetch
+        if layer_id == self.num_layer:
+            return (self.active_experts[self.buffer_id], self.active_experts_idx[self.buffer_id])
+        
+        prev_buffer_id = self.buffer_id
+        self.buffer_id ^= 1
+        active_expert_id = self.pattern[layer_id].nonzero().flatten().tolist()
+        expert_id = [(layer_id, expert_idx) for expert_idx in active_expert_id]
+        expert_id = sorted(expert_id, key=lambda uid: self.registered_experts[uid].offloaded)
+        expert_info = [self.registered_experts[id] for id in expert_id]
+
+        # Update eviction group info
+        eviction_group = self.group_infos[expert_info[0].eviction_group]
+        for info in expert_info:
+            eviction_group.mark_used(info)
+        
+        copy_idx = 0
+        for i in range(len(expert_info)):
+            if expert_info[i].offloaded == True:
+                copy_idx = i
+                break
+            else:
+                self.active_experts[self.buffer_id].append(self.main_modules[expert_info[i].index])
+                self.active_experts_idx[self.buffer_id].append(expert_info[i].uid)
+
+        while copy_idx < len(expert_info):
+            self.active_experts[self.buffer_id].append(self.swap_double_buffer(expert_info[copy_idx], eviction_group.choose_expert_to_evict(), self.buffer_id))
+            self.active_experts_idx[self.buffer_id].append(expert_info[copy_idx].uid)
+            copy_idx += 1
+        
+        return (self.active_experts[prev_buffer_id], self.active_experts_idx[prev_buffer_id])
 
     def load_experts_overlap(self, *uids, unordered = False):
         if unordered:
@@ -229,15 +305,12 @@ class ExpertCache:
         finally:
             self.active = False
 
-    def _swap(self, info_to_load: ExpertInfo, info_to_evict: ExpertInfo) -> nn.Module:
-        """Swap an offloaded expert (info_to_load) with an on-device expert (info_to_evict) return the loaded expert"""
-        # print("To load ", info_to_load.offloaded)
-        # print("To evict ", info_to_evict.offloaded)
+    def swap_double_buffer(self, info_to_load, info_to_evict, buffer_id):
         assert info_to_load.offloaded and not info_to_evict.offloaded
         assert info_to_load.eviction_group == info_to_evict.eviction_group
         # swap a single on-device expert with a single offloaded expert using buffers for parallelism
-        offloaded_storage_buffer = self.offloaded_storage_buffers.popleft()
-        device_expert_buffer = self.device_expert_buffers.popleft()
+        offloaded_storage_buffer = self.offloaded_storage_buffers[buffer_id].popleft()
+        device_expert_buffer = self.device_expert_buffers[buffer_id].popleft()
         
         with torch.cuda.stream(self.H2D_stream):
             device_expert_buffer.storage.copy_(self.offloaded_storages[info_to_load.index], non_blocking=True)
@@ -245,9 +318,38 @@ class ExpertCache:
         with torch.cuda.stream(self.D2H_stream):
             offloaded_storage_buffer.copy_(self.main_modules[info_to_evict.index].storage, non_blocking=True)
 
-        self.device_expert_buffers.append(self.main_modules[info_to_evict.index])
+        self.device_expert_buffers[buffer_id].append(self.main_modules[info_to_evict.index])
         self.main_modules[info_to_evict.index] = device_expert_buffer
-        self.offloaded_storage_buffers.append(self.offloaded_storages[info_to_load.index])
+        self.offloaded_storage_buffers[buffer_id].append(self.offloaded_storages[info_to_load.index])
+        self.offloaded_storages[info_to_load.index] = offloaded_storage_buffer
+
+        self.main_infos[info_to_evict.index] = info_to_load
+        self.offloaded_infos[info_to_load.index] = info_to_evict
+        info_to_evict.offloaded, info_to_load.offloaded = info_to_load.offloaded, info_to_evict.offloaded
+        info_to_evict.index, info_to_load.index = info_to_load.index, info_to_evict.index
+        self.group_infos[info_to_load.eviction_group].swap(info_to_load, info_to_evict)
+
+        return device_expert_buffer
+    
+    def _swap(self, info_to_load: ExpertInfo, info_to_evict: ExpertInfo) -> nn.Module:
+        """Swap an offloaded expert (info_to_load) with an on-device expert (info_to_evict) return the loaded expert"""
+        # print("To load ", info_to_load.offloaded)
+        # print("To evict ", info_to_evict.offloaded)
+        assert info_to_load.offloaded and not info_to_evict.offloaded
+        assert info_to_load.eviction_group == info_to_evict.eviction_group
+        # swap a single on-device expert with a single offloaded expert using buffers for parallelism
+        offloaded_storage_buffer = self.offloaded_storage_buffers[0].popleft()
+        device_expert_buffer = self.device_expert_buffers[0].popleft()
+        
+        with torch.cuda.stream(self.H2D_stream):
+            device_expert_buffer.storage.copy_(self.offloaded_storages[info_to_load.index], non_blocking=True)
+
+        with torch.cuda.stream(self.D2H_stream):
+            offloaded_storage_buffer.copy_(self.main_modules[info_to_evict.index].storage, non_blocking=True)
+
+        self.device_expert_buffers[0].append(self.main_modules[info_to_evict.index])
+        self.main_modules[info_to_evict.index] = device_expert_buffer
+        self.offloaded_storage_buffers[0].append(self.offloaded_storages[info_to_load.index])
         self.offloaded_storages[info_to_load.index] = offloaded_storage_buffer
 
         self.main_infos[info_to_evict.index] = info_to_load

@@ -109,6 +109,7 @@ def prepare_model(device):
 
     model = build_model(
         device=device,
+        num_layer=config.num_hidden_layers,
         quant_config=quant_config,
         offload_config=offload_config,
         state_path=state_path,
@@ -138,7 +139,7 @@ def main(args):
     device = torch.device("cuda:0")
     model = prepare_model(device)
     model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-    max_new_tokens = 64
+    max_new_tokens = 1
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -384,6 +385,10 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
         all_pattern_matrices = get_batch_data('token_pattern_matrices', batch) # (num_samples, prompt_len, 32, 8)
         all_token_ids = get_batch_data('token_ids', batch) # (num_samples, prompt_len+decoding_len)
         attention_mask = None
+
+        
+        # print("al pattern matric shape")
+        # print(all_pattern_matrices.shape)
         with torch.no_grad():  # Disable gradient calculation
             # Initialize variables to store outputs and past_key_values
             generated_token_ids = None
@@ -405,9 +410,15 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
                     crt_tokens = all_token_ids[:, prompt_len+token_index-1].view(-1, 1)
                     attention_mask = torch.cat([attention_mask, torch.ones((len(batch), 1), device=attention_mask.device)], dim=-1)
                     generated_token_ids = torch.cat((generated_token_ids, crt_tokens), dim=1)
-                prefetch_experts_by_pattern_matrices(
-                    model, pattern_matrix
-                )
+                # prefetch_experts_by_pattern_matrices(
+                #     model, pattern_matrix
+                # )
+                print("shape ")
+                # pattern_matrix = pattern_matrix.permute(1, 0)
+                pattern_matrix = torch.ones((32, 8))
+                pattern_matrix[12, 7] = 0
+                model.model.layers[0].block_sparse_moe.experts.set_pattern(pattern_matrix)
+                model.model.layers[0].block_sparse_moe.experts.load_first_layer()
                 outputs = model(
                     input_ids=crt_tokens,
                     attention_mask=attention_mask,
@@ -415,6 +426,7 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
                     use_cache=True  # Informs the model to return past key-values
                 )
 
+                break
                 # Update past_key_values for the next iteration
                 past_key_values = outputs.past_key_values
 
@@ -458,6 +470,7 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
     batch_indices = [batch_indices[i:i + batch_size] for i in range(0, len(batch_indices), batch_size)]
     batches = [[pattern_matrices[i] for i in indices] for indices in batch_indices]
 
+    torch.cuda.cudart().cudaProfilerStart()
     for batch_idx, batch in enumerate(batches):
         batch_start = time.time()
         generated_token_ids = custom_generate_with_fixed_data(
@@ -466,6 +479,8 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
         batch_end = time.time()
         num_tokens.append(generated_token_ids.numel())
         print(f"Processing batch {batch_idx} generated_token_ids.shape={generated_token_ids.shape} time costs: {batch_end-batch_start:.4f}s")
+        break
+    torch.cuda.cudart().cudaProfilerStop()
     torch.cuda.synchronize()
     end = time.time()
     total_num_tokens = np.sum(num_tokens)

@@ -171,6 +171,7 @@ def forward_post_hook(module, input, output):
 
 def build_model(
     device: torch.device,
+    num_layer: int,
     quant_config: QuantConfig,
     offload_config: OffloadConfig,
     state_path: str,
@@ -209,6 +210,7 @@ def build_model(
 
     expert_cache = ExpertCache(
         make_module=_make_module,
+        num_layer=num_layer,
         main_size=offload_config.main_size,
         offload_size=offload_config.offload_size,
         buffer_size=offload_config.buffer_size,
