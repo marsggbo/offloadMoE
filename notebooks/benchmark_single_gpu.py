@@ -107,8 +107,11 @@ def prepare_model(device):
     
 
 def main(args):
+    if os.environ.get('ipdb', False):
+        from ipdb import set_trace
+        set_trace()
     dataset_list = {
-        'alpaca': 16,
+        'alpaca': 2000,
         # 'sst2': 1000,
         # 'mrpc': 1000,
         # 'tick666-math': 1000,
@@ -204,6 +207,7 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
             pattern_matrices[len(batch)*batch_idx+i] = {
                 'prompt_text': text,
                 'prompt_token_ids': data['input_ids'][i].cpu(),
+                'prompt_attention_mask': data['attention_mask'][i].cpu(),
                 'token_ids': generated_token_ids[i].detach().cpu(),
                 'token_pattern_matrices': token_pattern_matrices_list[i]
             }
