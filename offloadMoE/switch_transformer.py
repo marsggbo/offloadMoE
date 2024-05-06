@@ -2377,7 +2377,7 @@ if __name__ == '__main__':
     ############################################
     # normal Switch-transformer
     ############################################
-    num_experts = 64
+    num_experts = 128
     config = SwitchTransformersConfig.from_pretrained(f"google/switch-base-{num_experts}")
     full_model = SwitchTransformersForConditionalGeneration(config)
     full_model = full_model.bfloat16()
@@ -2487,7 +2487,7 @@ if __name__ == '__main__':
         train_all_inputs += [text for text in dataset["train"]["inputs"]]
         valid_all_inputs += [text for text in dataset["validation"]["inputs"]]
     len(train_all_inputs), len(valid_all_inputs)
-    bs = 32
+    bs = 8
     # batch_text = [valid_all_inputs[i:i+bs] for i in range(0, len(valid_all_inputs), bs)]
     batch_text = [train_all_inputs[i:i+bs] for i in range(0, len(train_all_inputs), bs)]
 
@@ -2538,7 +2538,8 @@ if __name__ == '__main__':
             print(f"{i} Q: {tokenizer.decode(input_ids[i].cpu().numpy().tolist(), skip_special_tokens=True)}")
             print(f"{i} A: {tokenizer.decode(generated_ids[i].cpu().numpy().tolist(), skip_special_tokens=True)}")
     dataset_for_predictor = datasets.Dataset.from_dict(dataset_for_predictor)
-    dataset_for_predictor.save_to_disk(f'bigbench4switch{num_experts}_pattern_predictor')
+    dataset_for_predictor.push_to_hub(f'marsggbo/bigbench4switch{num_experts}_pattern_predictor')
+    # dataset_for_predictor.save_to_disk(f'bigbench4switch{num_experts}_pattern_predictor')
 
     # for i in range(10):
     #     do_sample = i > -1

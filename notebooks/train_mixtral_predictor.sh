@@ -4,7 +4,7 @@
 # python -m ipdb \
 WANDB_MODE=offline CUDA_VISIBLE_DEVICES=6 \
 torchrun --nproc_per_node=1 --master_port=26718 \
-train_pattern_predictor.py \
+train_mixtral_pattern_predictor.py \
    --model_name_or_path mistralai/Mistral-7B-Instruct-v0.2 \
     --output_dir ./logs/ \
     --bf16 True \
