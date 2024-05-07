@@ -30,7 +30,7 @@ from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
 from peft import get_peft_model, LoraConfig
 
 num_decoder_sparse_layer = 6 # switch-32/64/128/256
-num_experts_per_layer = 64
+num_experts_per_layer = 128
 NUM_LABELS = num_decoder_sparse_layer * num_experts_per_layer
 PADDING_SIDE = 'left'
 model_name_or_path = "google-t5/t5-base"
@@ -98,10 +98,6 @@ class DataArguments:
 
 
 @dataclass
-class TrainingArguments(transformers.TrainingArguments):
-    ...
-
-@dataclass
 class LoraArguments:
     use_lora: bool = field(default=False)
     lora_r: int = 8
@@ -141,16 +137,18 @@ class MoEPatternDataset(Dataset):
         training=False,
         train_max_seq_size = 512,
         eval_max_seq_size = 512,
+        num_experts_per_layer=num_experts_per_layer,
     ):
         self.data = dataset
         self.training = training
         self.truncate_ratio = 1.
         self.train_max_seq_size = train_max_seq_size
         self.eval_max_seq_size = eval_max_seq_size
+        self.num_experts_per_layer = num_experts_per_layer
 
     def __len__(self):
-        # return len(self.data)
-        return 8
+        return len(self.data)
+        # return 8
     
     def __getitem__(self, idx):
         seq_data = self.data[idx]
@@ -160,7 +158,7 @@ class MoEPatternDataset(Dataset):
         decoder_input_ids = torch.tensor(seq_data['decode_ids'], dtype=int)
         labels = np.stack(seq_data['decode_pattern']) # (#layers, decode_seq_len)
         labels = torch.from_numpy(labels).permute(1, 0) # (decode_seq_len, #layers)
-        labels = torch.nn.functional.one_hot(labels, num_classes=num_experts_per_layer).float() # (decode_seq_len, #layers, #experts)
+        labels = torch.nn.functional.one_hot(labels, num_classes=self.num_experts_per_layer).float() # (decode_seq_len, #layers, #experts)
         decode_seq_len = len(decoder_input_ids)
 
         if self.training:
@@ -407,7 +405,7 @@ def acc_precision_recall_f1(y_true, y_pred):
         'accuracy': accuracy,
     }
 
-def compute_metrics(outputs):    
+def compute_metrics(outputs):
     true_labels = outputs.label_ids
     pred_labels = outputs.predictions
     if isinstance(pred_labels, tuple):
@@ -417,7 +415,6 @@ def compute_metrics(outputs):
     elif len(pred_labels.shape)==4:
         bs, seq_len, num_layer, num_experts = pred_labels.shape
         dim = num_layer * num_experts
-    assert dim == NUM_LABELS, "Dimension of predictions should be {} but got {}".format(NUM_LABELS, dim)
     true_labels = true_labels.reshape(-1, num_experts_per_layer)
     pred_labels = pred_labels.reshape(-1, num_experts_per_layer)
         
@@ -432,8 +429,9 @@ def compute_metrics(outputs):
     )
 
 def train():
+    
     parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments, LoraArguments, CustomArguments)
+        (ModelArguments, DataArguments, transformers.TrainingArguments, LoraArguments, CustomArguments)
     )
     (
         model_args,
@@ -487,7 +485,7 @@ def train():
         if custom_args.ckpt_path:
             # Load the model weights
             print('loading weights for evaluation')
-            if custom_args.ckpt_path.endswith('.pt'):
+            if not custom_args.ckpt_path.endswith('.safetensors'):
                 model.load_state_dict(torch.load(custom_args.ckpt_path, map_location='cpu'), strict=True)
             else:
                 loaded_weights = load_file(custom_args.ckpt_path)
@@ -504,20 +502,23 @@ def train():
     ################################
     print('loading MoEPatternDataset')
     origin_data = load_dataset(data_args.data_path)['train']
-    # shuffled_data = origin_data.shuffle(seed=666)
-    # train_size = int(len(shuffled_data) * 0.9)
-    # train_data = shuffled_data.select(range(train_size))
-    # eval_data = shuffled_data.select(range(train_size, len(shuffled_data)))
-    train_data = eval_data = origin_data
+    shuffled_data = origin_data.shuffle(seed=666)
+    train_size = int(len(shuffled_data) * 0.9)
+    train_data = shuffled_data.select(range(train_size))
+    eval_data = shuffled_data.select(range(train_size, len(shuffled_data)))
+    # train_data = origin_data
+    # train_data = eval_data = origin_data
     train_dataset = MoEPatternDataset(
         train_data,
         training=True,
-        train_max_seq_size=custom_args.train_max_seq_size
+        train_max_seq_size=custom_args.train_max_seq_size,
+        num_experts_per_layer=num_experts_per_layer
     )
     eval_dataset = MoEPatternDataset(
         eval_data,
         training=False,
         eval_max_seq_size=custom_args.eval_max_seq_size,
+        num_experts_per_layer=num_experts_per_layer
     )
 
     # decouple optimization of base and head modules
@@ -543,8 +544,9 @@ def train():
     model.config.use_cache = False
     if custom_args.eval_only:
         print('Start evaluating')
-        results = trainer.evaluate()
-        print(results)
+        with torch.inference_mode():
+            results = trainer.evaluate()
+            print(results)
         return results
 
     print('Start training')
