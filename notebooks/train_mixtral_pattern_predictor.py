@@ -27,11 +27,6 @@ from transformers import (
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from fastchat.train.train import (
-    DataArguments,
-    ModelArguments,
-    TrainingArguments
-)
 
 from peft import get_peft_model, LoraConfig
 
@@ -76,6 +71,30 @@ def create_optimizer_and_scheduler(
     )
 
     return optimizer, scheduler
+
+@dataclass
+class ModelArguments:
+    model_name_or_path: Optional[str] = field(default=model_name_or_path)
+    trust_remote_code: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether or not to allow for custom models defined on the Hub in their own modeling files"
+        },
+    )
+    padding_side: str = field(
+        default="right", metadata={"help": "The padding side in tokenizer"}
+    )
+
+
+@dataclass
+class DataArguments:
+    data_path: str = field(
+        default=f"marsggbo/bigbench4switch{num_experts_per_layer}_pattern_predictor", metadata={"help": "Path to the training data."}
+    )
+    eval_data_path: str = field(
+        default=None, metadata={"help": "Path to the evaluation data."}
+    )
+    lazy_preprocess: bool = False
 
 @dataclass
 class LoraArguments:
@@ -229,11 +248,12 @@ def new_forward(
         )
 
         hidden_states = outputs[0]
-        logits = []
-        for i in range(len(self.lm_head)):
-            logits_per_expert = self.lm_head[i](hidden_states).float() # (bs, seq_len, num_experts)
-            logits.append(logits_per_expert)
-        logits = torch.stack(logits, dim=-2) # # (bs, seq_len, num_layers, num_experts)
+        # logits = []
+        # for i in range(len(self.lm_head)):
+        #     logits_per_expert = self.lm_head[i](hidden_states).float() # (bs, seq_len, num_experts)
+        #     logits.append(logits_per_expert)
+        # logits = torch.stack(logits, dim=-2) # # (bs, seq_len, num_layers, num_experts)
+        logits = self.lm_head(hidden_states).float() # (bs, seq_len, num_layers*num_experts)
 
         loss = None
         if labels is not None:
@@ -248,15 +268,15 @@ def new_forward(
             # BCE loss (not recommended)
             # labels = labels.to(logits.device).float().view(logits.shape)
             # loss = nn.BCEWithLogitsLoss()(logits, labels)
-            if not self.training:
-                preds = top_2_one_hot(logits)
-                print('predicted case')
-                acc = get_acc(preds, labels, 1)
-                random_logits = torch.rand_like(logits)
-                rand_preds = top_2_one_hot(random_logits)
-                print('random case')
-                acc = get_acc(rand_preds, labels, 1)
-                # print(acc)
+            # if not self.training:
+            #     preds = top_2_one_hot(logits)
+            #     print('predicted case')
+            #     acc = get_acc(preds, labels, 1)
+            #     random_logits = torch.rand_like(logits)
+            #     rand_preds = top_2_one_hot(random_logits)
+            #     print('random case')
+            #     acc = get_acc(rand_preds, labels, 1)
+            #     # print(acc)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -381,7 +401,7 @@ def compute_metrics(outputs):
 
 def train():
     parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments, LoraArguments, CustomArguments)
+        (ModelArguments, DataArguments, transformers.TrainingArguments, LoraArguments, CustomArguments)
     )
     (
         model_args,
@@ -390,6 +410,11 @@ def train():
         lora_args,
         custom_args
     ) = parser.parse_args_into_dataclasses()
+    print(f'Model args: {model_args}')
+    print(f'Data args: {data_args}')
+    print(f'Lora args: {lora_args}')
+    print(f'Custom args: {custom_args}')
+    print(f'Training args: {training_args}')
     if custom_args.ipdb:
         from ipdb import set_trace
         set_trace()
@@ -406,15 +431,16 @@ def train():
     # config.intermediate_size = 2048
     # model = AutoModelForCausalLM.from_config(config)
     ## for real training
-    predictor_num_layers = 2
+    predictor_num_layers = 4
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         cache_dir="/data/common/mixtral/")
     model.model.layers = model.model.layers[:predictor_num_layers]
     model.forward = types.MethodType(new_forward, model)
-    model.lm_head = nn.ModuleList([
-        nn.Linear(model.config.hidden_size, 8, bias=False) for i in range(32)
-    ])
+    model.lm_head = nn.Linear(model.config.hidden_size, NUM_LABELS, bias=False)
+    # model.lm_head = nn.ModuleList([
+    #     nn.Linear(model.config.hidden_size, 8, bias=False) for i in range(32)
+    # ])
     
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,

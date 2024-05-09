@@ -30,7 +30,7 @@ from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
 from peft import get_peft_model, LoraConfig
 
 num_decoder_sparse_layer = 6 # switch-32/64/128/256
-num_experts_per_layer = 32
+num_experts_per_layer = 128
 NUM_LABELS = num_decoder_sparse_layer * num_experts_per_layer
 PADDING_SIDE = 'left'
 model_name_or_path = "google-t5/t5-base"

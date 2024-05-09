@@ -2,8 +2,8 @@
 
 # WANDB_MODE=online CUDA_VISIBLE_DEVICES=1 \
 # python -m ipdb \
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=6 \
-torchrun --nproc_per_node=1 --master_port=26718 \
+WANDB_MODE=offline CUDA_VISIBLE_DEVICES=2 \
+torchrun --nproc_per_node=1 --master_port=26713 \
 train_mixtral_pattern_predictor.py \
    --model_name_or_path mistralai/Mistral-7B-Instruct-v0.2 \
     --output_dir ./logs/ \
@@ -19,7 +19,7 @@ train_mixtral_pattern_predictor.py \
     --load_best_model_at_end True \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 2 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 4 \
     --learning_rate 4e-5 \
     --weight_decay 5e-3 \
     --warmup_ratio 0.03 \
