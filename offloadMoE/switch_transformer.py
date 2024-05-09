@@ -22,6 +22,7 @@ from typing import Optional, Tuple, Union
 import functools
 import os
 from glob import glob
+from safetensors.torch import load_file
 
 import torch
 import torch.nn as nn
@@ -1970,7 +1971,6 @@ def build_offload_model(config=None):
     import json
     import os
     import typing as tp
-    from safetensors.torch import load_file
 
     pretrained_weights_map = {
         'google/switch-base-8': {
@@ -2377,7 +2377,7 @@ if __name__ == '__main__':
     ############################################
     # normal Switch-transformer
     ############################################
-    num_experts = 128
+    num_experts = 32
     config = SwitchTransformersConfig.from_pretrained(f"google/switch-base-{num_experts}")
     full_model = SwitchTransformersForConditionalGeneration(config)
     full_model = full_model.bfloat16()
@@ -2487,7 +2487,7 @@ if __name__ == '__main__':
         train_all_inputs += [text for text in dataset["train"]["inputs"]]
         valid_all_inputs += [text for text in dataset["validation"]["inputs"]]
     len(train_all_inputs), len(valid_all_inputs)
-    bs = 8
+    bs = 16
     # batch_text = [valid_all_inputs[i:i+bs] for i in range(0, len(valid_all_inputs), bs)]
     batch_text = [train_all_inputs[i:i+bs] for i in range(0, len(train_all_inputs), bs)]
 

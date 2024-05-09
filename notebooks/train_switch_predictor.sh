@@ -1,5 +1,5 @@
 
-WANDB_MODE=offline CUDA_VISIBLE_DEVICES=0 \
+WANDB_MODE=online CUDA_VISIBLE_DEVICES=1 \
 torchrun --nproc_per_node=1 --master_port=26716 \
 train_switch_pattern_predictor.py \
    --model_name_or_path google-t5/t5-base \

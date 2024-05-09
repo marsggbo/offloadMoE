@@ -30,7 +30,7 @@ from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
 from peft import get_peft_model, LoraConfig
 
 num_decoder_sparse_layer = 6 # switch-32/64/128/256
-num_experts_per_layer = 128
+num_experts_per_layer = 32
 NUM_LABELS = num_decoder_sparse_layer * num_experts_per_layer
 PADDING_SIDE = 'left'
 model_name_or_path = "google-t5/t5-base"
@@ -89,7 +89,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(
-        default="marsggbo/bigbench4switch64_pattern_predictor", metadata={"help": "Path to the training data."}
+        default=f"marsggbo/bigbench4switch{num_experts_per_layer}_pattern_predictor", metadata={"help": "Path to the training data."}
     )
     eval_data_path: str = field(
         default=None, metadata={"help": "Path to the evaluation data."}
@@ -440,6 +440,11 @@ def train():
         lora_args,
         custom_args
     ) = parser.parse_args_into_dataclasses()
+    print(f'Model args: {model_args}')
+    print(f'Data args: {data_args}')
+    print(f'Lora args: {lora_args}')
+    print(f'Custom args: {custom_args}')
+    print(f'Training args: {training_args}')
     if custom_args.ipdb:
         from ipdb import set_trace
         set_trace()
