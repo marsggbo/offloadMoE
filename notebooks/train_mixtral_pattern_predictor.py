@@ -31,7 +31,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import get_peft_model, LoraConfig
 
 num_layers = 32
-num_experts_per_layer = 8
+num_experts_per_layer = 16
 NUM_LABELS = num_layers * num_experts_per_layer
 PADDING_SIDE = 'left'
 model_name_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
@@ -136,12 +136,14 @@ class MoEPatternDataset(Dataset):
         training=False,
         train_max_seq_size = 512,
         eval_max_seq_size = 512,
+        num_experts_per_layer=num_experts_per_layer,
     ):
         self.data = dataset
         self.training = training
         self.truncate_ratio = 1.
         self.train_max_seq_size = train_max_seq_size
         self.eval_max_seq_size = eval_max_seq_size
+        self.num_experts_per_layer = num_experts_per_layer
 
     def __len__(self):
         return len(self.data)
@@ -152,6 +154,9 @@ class MoEPatternDataset(Dataset):
         input_ids = torch.tensor(input_ids, dtype=int)
         labels = np.stack(seq_data['token_pattern_matrices']) # (seq_len, #layers, #experts)
         labels = torch.from_numpy(labels).int()
+        num_to_pad = self.num_experts_per_layer - labels.shape[-1]
+        pad_labels = torch.zeros(*labels.shape[:-1], num_to_pad)
+        labels = torch.cat((labels, pad_labels), dim=-1)
         attention_mask = torch.ones(len(input_ids)) # (seq_len,)
         seq_len = len(input_ids)
 
@@ -431,10 +436,10 @@ def train():
     # config.intermediate_size = 2048
     # model = AutoModelForCausalLM.from_config(config)
     ## for real training
-    predictor_num_layers = 4
     model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         cache_dir="/data/common/mixtral/")
+    predictor_num_layers = 2
     model.model.layers = model.model.layers[:predictor_num_layers]
     model.forward = types.MethodType(new_forward, model)
     model.lm_head = nn.Linear(model.config.hidden_size, NUM_LABELS, bias=False)
@@ -452,12 +457,6 @@ def train():
     )
     ## 方案 1：设置 pad_token
     tokenizer.pad_token = tokenizer.unk_token
-    # # 方案 2：设置 pad_token
-    # # 确保tokenizer已经设置了pad_token，如果没有，我们添加一个
-    # if tokenizer.pad_token is None:
-    #     tokenizer.add_special_tokens({'pad_token': '<pad>'})
-    # # 需要更新模型的词汇表大小
-    # model.resize_token_embeddings(len(tokenizer))
     
     ###############################
     # 定义 LoRA 配置
@@ -498,8 +497,9 @@ def train():
     print('loading MoEPatternDataset')
     origin_data = load_dataset("marsggbo/mixtral_8x7b_moe_alpaca_2k_token_pattern")['train']
     # shuffled_data = origin_data.shuffle(seed=666)
-    # train_data = shuffled_data.select(range(1500))
-    # eval_data = shuffled_data.select(range(1900, 2000))
+    # train_size = int(len(shuffled_data) * 0.9)
+    # train_data = shuffled_data.select(range(train_size))
+    # eval_data = shuffled_data.select(range(train_size, len(shuffled_data)))
     train_data = eval_data = origin_data
     train_dataset = MoEPatternDataset(
         train_data,
@@ -548,10 +548,9 @@ def train():
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
-    trainer.save_state()
     if training_args.local_rank == 0:
-        # model.save_pretrained(output_dir, state_dict=state_dict)
-        model.save_pretrained(output_dir)
+        model.save_pretrained(training_args.output_dir+'/model_state_dict', state_dict=model.state_dict(), safe_serialization=False)
+
 
 def test_dataset():
     tokenizer = AutoTokenizer.from_pretrained(
