@@ -31,7 +31,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from peft import get_peft_model, LoraConfig
 
 num_layers = 32
-num_experts_per_layer = 16
+num_experts_per_layer = 8
 NUM_LABELS = num_layers * num_experts_per_layer
 PADDING_SIDE = 'left'
 model_name_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
@@ -146,39 +146,41 @@ class MoEPatternDataset(Dataset):
         self.num_experts_per_layer = num_experts_per_layer
 
     def __len__(self):
+        # return 8
         return len(self.data)
     
     def __getitem__(self, idx):
         seq_data = self.data[idx]
         input_ids = seq_data['token_ids'] # (seq_len,)
         input_ids = torch.tensor(input_ids, dtype=int)
+        seq_len = len(input_ids)
+        prompt_len = seq_data['prompt_tokens_len']
+        decoding_len = seq_len - prompt_len
         labels = np.stack(seq_data['token_pattern_matrices']) # (seq_len, #layers, #experts)
         labels = torch.from_numpy(labels).int()
         num_to_pad = self.num_experts_per_layer - labels.shape[-1]
         pad_labels = torch.zeros(*labels.shape[:-1], num_to_pad)
         labels = torch.cat((labels, pad_labels), dim=-1)
         attention_mask = torch.ones(len(input_ids)) # (seq_len,)
-        seq_len = len(input_ids)
 
         if self.training:
-            self.truncate_ratio = random.uniform(0.2, 1)
+            self.truncate_ratio = random.uniform(0.1, 1)
             if self.train_max_seq_size is not None:
-                truncate_length = min(int(seq_len * self.truncate_ratio), self.train_max_seq_size)
+                truncate_length = min(int(decoding_len * self.truncate_ratio), self.train_max_seq_size)
             else:
-                truncate_length = int(seq_len * self.truncate_ratio)
-            start_index = random.randint(0, seq_len - truncate_length)
+                truncate_length = int(decoding_len * self.truncate_ratio)
         else:
             if self.eval_max_seq_size is not None:
-                truncate_length = min(int(seq_len * self.truncate_ratio), self.eval_max_seq_size)
+                truncate_length = min(int(decoding_len * self.truncate_ratio), self.eval_max_seq_size)
             else:
-                truncate_length = int(seq_len * self.truncate_ratio)
-            start_index = 0
+                truncate_length = int(decoding_len * self.truncate_ratio)
         start_index = 0
-        end_index = start_index + truncate_length
+        end_index = prompt_len + truncate_length
         return {
             'input_ids': input_ids[start_index:end_index],
             'attention_mask': attention_mask[start_index:end_index],
-            'labels': labels[start_index:end_index]
+            'labels': labels[start_index:end_index],
+            'decode_len': truncate_length
         }
 
 
@@ -210,6 +212,7 @@ class PatternDataCollatorWithPadding(DataCollatorWithPadding):
             padded_labels.append(padded_label)
         # 将padded_labels转换为一个tensor，并加入到batch中
         batch['labels'] = torch.stack(padded_labels, dim=0)
+        batch['decode_len'] = torch.tensor([feature['decode_len'] for feature in features])
         
         if "label" in batch:
             batch["labels"] = batch["label"]
@@ -228,6 +231,7 @@ def new_forward(
     past_key_values: Optional[List[torch.FloatTensor]] = None,
     inputs_embeds: Optional[torch.FloatTensor] = None,
     labels: Optional[torch.LongTensor] = None,
+    decode_len: Optional[torch.LongTensor] = None,
     use_cache: Optional[bool] = None,
     output_attentions: Optional[bool] = None,
     output_hidden_states: Optional[bool] = None,
@@ -264,24 +268,20 @@ def new_forward(
         if labels is not None:
             # masked BCE loss
             labels = labels.to(logits.device).float()
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                logits.view(-1, num_experts_per_layer),
-                labels.view(-1, num_experts_per_layer),
-                reduction='none')
-            loss_mask = labels.view(-1, num_experts_per_layer).sum(-1) != 0
-            loss = loss[loss_mask].sum() / loss_mask.sum()
-            # BCE loss (not recommended)
-            # labels = labels.to(logits.device).float().view(logits.shape)
-            # loss = nn.BCEWithLogitsLoss()(logits, labels)
-            # if not self.training:
-            #     preds = top_2_one_hot(logits)
-            #     print('predicted case')
-            #     acc = get_acc(preds, labels, 1)
-            #     random_logits = torch.rand_like(logits)
-            #     rand_preds = top_2_one_hot(random_logits)
-            #     print('random case')
-            #     acc = get_acc(rand_preds, labels, 1)
-            #     # print(acc)
+            w1 = torch.zeros_like(labels)
+            pad_lens = (attention_mask==0).sum(-1).view(-1).int()
+            seq_lens = attention_mask.sum(-1).view(-1).int()
+            for i in range(labels.size(0)):
+                w1[:, pad_lens[i]:seq_lens[i]-decode_len[i],:,:]=0.2
+                w1[:,-1*decode_len[i]:,:,:] = 1 # decoding token weights
+            loss_fn = torch.nn.BCEWithLogitsLoss(weight=w1, reduction='mean')
+            loss = loss_fn(logits.view(*labels.shape), labels)
+            # loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            #     logits.view(-1, num_experts_per_layer),
+            #     labels.view(-1, num_experts_per_layer),
+            #     reduction='none')
+            # loss_mask = labels.view(-1, num_experts_per_layer).sum(-1) != 0
+            # loss = loss[loss_mask].sum() / loss_mask.sum()
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -300,17 +300,8 @@ def acc_precision_recall_f1(y_true, y_pred):
     # 真正例 (True Positives)
     TP = np.sum((y_true == 1) & (y_pred == 1))
     
-    # 假正例 (False Positives)
-    FP = np.sum((y_true == 0) & (y_pred == 1))
-    
-    # 假负例 (False Negatives)
-    FN = np.sum((y_true == 1) & (y_pred == 0))
-    
-    # 真负例 (True Negatives)
-    TN = np.sum((y_true == 0) & (y_pred == 0))
-    
-    y_true = y_true.reshape(-1, 256)
-    y_pred = y_pred.reshape(-1, 256)
+    y_true = y_true.reshape(-1, NUM_LABELS)
+    y_pred = y_pred.reshape(-1, NUM_LABELS)
     print(f"origin y_true.shape={y_true.shape}")
     indices = np.any(y_true, axis=-1)
     y_true = y_true[indices]
@@ -320,16 +311,10 @@ def acc_precision_recall_f1(y_true, y_pred):
     # 准确率
     num_tokens = y_true.shape[0]
     accuracy = TP / (num_tokens*64)
-    recall = 0
-    precision = 0
-    f1 = 0
     print(f"non-padding ratio: {indices.sum()}/{len(indices)}={indices.sum()/len(indices)}\n")
 
     return {
         'accuracy': accuracy,
-        'recall': recall,
-        'precision': precision,
-        'f1': f1,
     }
 
 def top_2_one_hot(logits):
@@ -382,9 +367,11 @@ def get_acc(logits, labels, verbose=False):
     return accuracy
 
 
-def compute_metrics(outputs):    
+def compute_metrics(outputs, decode_len=64):    
     true_labels = outputs.label_ids
     pred_labels = outputs.predictions
+    true_labels=true_labels[:,-decode_len:,...]
+    pred_labels=pred_labels[:,-decode_len:,...]
     if len(pred_labels.shape) == 3:
         bs, seq_len, dim = pred_labels.shape
     elif len(pred_labels.shape)==4:
@@ -482,8 +469,11 @@ def train():
         if custom_args.ckpt_path:
             # Load the model weights
             print('loading weights for evaluation')
-            loaded_weights = load_file(custom_args.ckpt_path)
-            model.load_state_dict(loaded_weights)
+            if not custom_args.ckpt_path.endswith('.safetensors'):
+                model.load_state_dict(torch.load(custom_args.ckpt_path, map_location='cpu'), strict=True)
+            else:
+                loaded_weights = load_file(custom_args.ckpt_path)
+                model.load_state_dict(loaded_weights, strict=False)
     
     ################################
     # 实例化DataCollatorWithPadding
