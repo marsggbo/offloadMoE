@@ -268,20 +268,21 @@ def new_forward(
         if labels is not None:
             # masked BCE loss
             labels = labels.to(logits.device).float()
-            w1 = torch.zeros_like(labels)
-            pad_lens = (attention_mask==0).sum(-1).view(-1).int()
-            seq_lens = attention_mask.sum(-1).view(-1).int()
-            for i in range(labels.size(0)):
-                w1[:, pad_lens[i]:seq_lens[i]-decode_len[i],:,:]=0.2
-                w1[:,-1*decode_len[i]:,:,:] = 1 # decoding token weights
-            loss_fn = torch.nn.BCEWithLogitsLoss(weight=w1, reduction='mean')
-            loss = loss_fn(logits.view(*labels.shape), labels)
-            # loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            #     logits.view(-1, num_experts_per_layer),
-            #     labels.view(-1, num_experts_per_layer),
-            #     reduction='none')
-            # loss_mask = labels.view(-1, num_experts_per_layer).sum(-1) != 0
-            # loss = loss[loss_mask].sum() / loss_mask.sum()
+            # w1 = torch.zeros_like(labels)
+            # pad_lens = (attention_mask==0).sum(-1).view(-1).int()
+            # seq_lens = attention_mask.sum(-1).view(-1).int()
+            # for i in range(labels.size(0)):
+            #     # w1[:, pad_lens[i]:,:,:]=1
+            #     # w1[:, pad_lens[i]:seq_lens[i]-decode_len[i],:,:]=0.2 # prompt token weights
+            #     w1[:,-1*decode_len[i]:,:,:] = 1 # decoding token weights
+            # loss_fn = torch.nn.BCEWithLogitsLoss(weight=w1, reduction='mean')
+            # loss = loss_fn(logits.view(*labels.shape), labels)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits.view(-1, num_experts_per_layer),
+                labels.view(-1, num_experts_per_layer),
+                reduction='none')
+            loss_mask = labels.view(-1, num_experts_per_layer).sum(-1) != 0
+            loss = loss[loss_mask].sum() / loss_mask.sum()
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -367,11 +368,17 @@ def get_acc(logits, labels, verbose=False):
     return accuracy
 
 
-def compute_metrics(outputs, decode_len=64):    
-    true_labels = outputs.label_ids
-    pred_labels = outputs.predictions
-    true_labels=true_labels[:,-decode_len:,...]
-    pred_labels=pred_labels[:,-decode_len:,...]
+def compute_metrics(outputs, decode_len=64):
+    true_labels = outputs.label_ids # (bs, seq_len, num_layer, num_experts)
+    pred_labels = outputs.predictions # (bs, seq_len, num_layer*num_experts)
+    bs, seq_len, num_layer, num_experts = true_labels.shape
+    labels = true_labels.reshape(*true_labels.shape[:2], -1)
+    mask = labels.mean(-1)!=-100
+    valid_lens = mask.sum(-1)
+    start_indices = valid_lens-decode_len
+    all_indices = start_indices[:, np.newaxis] + np.arange(decode_len)
+    true_labels = true_labels[np.arange(bs)[:, np.newaxis], all_indices, ...]
+    pred_labels = pred_labels[np.arange(bs)[:, np.newaxis], all_indices, ...]
     if len(pred_labels.shape) == 3:
         bs, seq_len, dim = pred_labels.shape
     elif len(pred_labels.shape)==4:
