@@ -1738,7 +1738,11 @@ class MixtralForSequenceClassification(MixtralPreTrainedModel):
             attentions=transformer_outputs.attentions,
         )
 
-def build_offload_model(config=None):
+def build_offload_model(
+    offload_per_layer=4,
+    buffer_size=4,
+    config=None
+):
     
     from offloadMoE.expert_cache import ExpertCache
     from offloadMoE.custom_layers import SparseMoeWrapper
@@ -1856,15 +1860,17 @@ def build_offload_model(config=None):
             module_idx = f"model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}"
             weight_map = json.load(f)["weight_map"]
             state_fpaths = [weight_map[f"{module_idx}.w{i}.weight"] for i in [1,2,3]]
-            assert len(set(state_fpaths))==1
-            state_fpath = state_fpaths[0]
+            state_fpaths = set(state_fpaths)
 
-        state_dict = load_file(os.path.join(states_dir, state_fpath), device=str(device))
-        expert = make_empty_expert(config).bfloat16()
-        for idx in range(1, 4):
-            layer = getattr(expert, f"w{idx}")
-            w_to_load = state_dict[f'model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w{idx}.weight']
-            layer.weight.data.copy_(w_to_load)
+        for state_fpath in state_fpaths:
+            state_dict = load_file(os.path.join(states_dir, state_fpath), device=str(device))
+            expert = make_empty_expert(config).bfloat16()
+            for idx in range(1, 4):
+                layer = getattr(expert, f"w{idx}")
+                key = f'model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w{idx}.weight'
+                if key in state_dict:
+                    w_to_load = state_dict[key]
+                    layer.weight.data.copy_(w_to_load)
 
         return MixtralExpertWrapper(expert, device)
 
@@ -1886,19 +1892,15 @@ def build_offload_model(config=None):
         )
         config.offload = True
       
-    config.num_hidden_layers = 1
-    state_path = '/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/1e637f2d7cb0a9d6fb1922f305cb784995190a83'
+    # config.num_hidden_layers = 1
+    state_path = '/home/nus-hx/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/125c431e2ff41a156b9f9076f744d2f35dd6e67a'
     state_dict_00 = load_00_expert_state_dict(state_path, device)
-    ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
-    offload_per_layer = 4
-    # offload_per_layer = 5
-    ###############################################################
 
     num_experts = config.num_local_experts
     offload_config = OffloadConfig(
         main_size=config.num_hidden_layers * (num_experts - offload_per_layer),
         offload_size=config.num_hidden_layers * offload_per_layer,
-        buffer_size=4,
+        buffer_size=buffer_size,
         offload_per_layer=offload_per_layer,
     )
 

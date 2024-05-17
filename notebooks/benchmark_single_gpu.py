@@ -63,14 +63,17 @@ def prepare_data(dataset_list: Dict[str,int]):
     print(f"The data contains {len(data)} samples.")
     return data
 
-def prepare_model(device):
+def prepare_model(
+    device,
+    buffer_size=4,
+    offload_per_layer = 4
+):
     print(f'Building and Loading a MoE model...')
     quantized_model_name = "lavawolfiee/Mixtral-8x7B-Instruct-v0.1-offloading-demo"
     state_path = "/home/nus-hx/code/offloadMoE/data"
 
     config = AutoConfig.from_pretrained(quantized_model_name)
     ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
-    offload_per_layer = 4
     # offload_per_layer = 5
     ###############################################################
 
@@ -78,7 +81,7 @@ def prepare_model(device):
     offload_config = OffloadConfig(
         main_size=config.num_hidden_layers * (num_experts - offload_per_layer),
         offload_size=config.num_hidden_layers * offload_per_layer,
-        buffer_size=4,
+        buffer_size=buffer_size,
         offload_per_layer=offload_per_layer,
     )
 
@@ -107,6 +110,17 @@ def prepare_model(device):
     
 
 def main(args):
+    from offloadMoE.modeling_mixtral import build_offload_model
+    import torch.distributed as dist
+    from accessory.util import misc
+    import fairscale.nn.model_parallel.initialize as fs_init
+    
+    def init_env():
+        # define the model
+        misc.init_distributed_mode()
+        fs_init.initialize_model_parallel(dist.get_world_size())
+
+    init_env()
     if os.environ.get('ipdb', False):
         from ipdb import set_trace
         set_trace()
@@ -129,9 +143,10 @@ def main(args):
     batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
 
     device = torch.device("cuda:0")
-    model = prepare_model(device)
+    model = prepare_model(device, offload_per_layer=4, buffer_size=4)
+    # model = build_offload_model(offload_per_layer=4, buffer_size=4)
     model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-    max_new_tokens = 64
+    max_new_tokens = 4
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
