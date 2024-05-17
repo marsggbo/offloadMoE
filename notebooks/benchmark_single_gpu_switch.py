@@ -4,6 +4,7 @@ import time
 import os
 import torch
 import json
+from types import SimpleNamespace
 import numpy as np
 from transformers import AutoTokenizer
 from datasets import load_dataset
@@ -47,21 +48,22 @@ def main(args):
     # data = np.array(data)[indices]
     ###### length-sorted order
     data = np.array(sorted(data, key=len))
-    batch_size = 8
+    batch_size = 16
     batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
 
     device = torch.device("cuda:0")
     model_name = "google/switch-base-16"
-    state_path='/home/nus-hx/.cache/huggingface/hub/models--google--switch-base-16/snapshots/0ef7d88ed50ec5f2cfdc019e81cef04d19700f8f'
+    state_path='~/.cache/huggingface/hub/models--google--switch-base-16/snapshots/*'
+    state_path=os.path.expanduser(state_path)
     model = build_offload_model(
-        offload_per_layer=12,
-        buffer_size= 6,
+        offload_per_layer=8,
+        buffer_size=8,
         state_path=state_path,
         model_name=model_name,
         device=device
     )
     model = model.to(device)
-    max_new_tokens = 2
+    max_new_tokens = 1
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     ###### baseline: original implementation
@@ -87,12 +89,13 @@ def main(args):
 
 
 def run_benchmark(model, tokenizer, batches, max_new_tokens, device):
+    torch.cuda.reset_peak_memory_stats(device=device)
     num_tokens = []
     torch.cuda.synchronize()
     start = time.time()
     for batch_idx, batch in enumerate(batches):
         batch = batch.tolist()
-        data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
+        data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True, truncation=True, max_length=512)
         data = {key: val.to(device) for key, val in data.items()}
         data['decoder_input_ids'] = torch.zeros(
             (data['input_ids'].shape[0],1), dtype=torch.long, device=device)
@@ -107,6 +110,9 @@ def run_benchmark(model, tokenizer, batches, max_new_tokens, device):
     total_num_tokens = np.sum(num_tokens)
     throughput = total_num_tokens / (end - start)
     print(f"Throughput: {total_num_tokens} tokens/{end-start} sec = {throughput} tokens/s")
+    peak_memory = torch.cuda.max_memory_reserved(device=device)
+    print(f"Peak GPU Memory Usage: {peak_memory / 1024 ** 2:.2f} MB")
+    time.sleep(10)
 
 
 def custom_generate(
@@ -191,16 +197,57 @@ def top_p_filtering(logits, top_p=0.9):
     logits[indices_to_remove] = float('-inf')
     return logits
 
+def init_distributed_mode(args=SimpleNamespace()):
+    def find_free_port(start_port: int, end_port: int):
+        """
+        Find a free port within the specified range.
+        """
+        for port in range(start_port, end_port):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", port))  # Try to bind to the port
+                s.close()  # Close the socket if successful
+                return port
+            except OSError as e:
+                # print(f"Port {port} is in use, trying next port.")
+                continue
+        raise RuntimeError(f"No free ports found in range {start_port}-{end_port}")
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and "LOCAL_RANK" in os.environ:
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.rank = int(os.environ["RANK"])
+        args.gpu = int(os.environ['LOCAL_RANK'])
+        args.local_rank = args.gpu
+        args.dist_url = 'env://'
+    else:
+        os.environ['MASTER_ADDR'] = "127.0.0.1"
+        os.environ['MASTER_PORT'] = str(find_free_port(9000, 10000))
+        os.environ['RANK'] = '0'
+        os.environ['LOCAL_RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        args.rank = 0
+        args.gpu = args.local_rank = 0
+        args.world_size = 1
+        args.dist_url = 'env://'
+
+    args.distributed = True
+
+    torch.cuda.set_device(args.gpu)
+    args.dist_backend = 'nccl'
+    print('| distributed init (rank {}): {}, gpu {}'.format(
+        args.rank, args.dist_url, args.gpu), flush=True)
+    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                         world_size=args.world_size, rank=args.rank)
+    torch.distributed.barrier()
+
 
 if __name__ == '__main__':
     import argparse
     import torch.distributed as dist
-    from accessory.util import misc
     import fairscale.nn.model_parallel.initialize as fs_init
     
     def init_env():
         # define the model
-        misc.init_distributed_mode()
+        init_distributed_mode()
         fs_init.initialize_model_parallel(dist.get_world_size())
 
     init_env()
