@@ -12,6 +12,7 @@ from transformers import TextStreamer
 from hqq.core.quantize import BaseQuantizeConfig
 from offloadMoE.build_model import OffloadConfig, QuantConfig, build_model
 from offloadMoE.custom_layers import SparseMoeWrapper
+from offloadMoE.switch_transformer import build_offload_model
 
 
 def load_json(file):
@@ -20,102 +21,31 @@ def load_json(file):
     return data
 
 def prepare_data(dataset_list: Dict[str,int]):
-    data = []
-    # alpaca_data
-    if 'alpaca' in dataset_list:
-        alpaca_data = load_json("/home/nus-hx/code/Sequence-Scheduling/data/alpaca-train-10k.json")
-        num_samples = dataset_list['alpaca']
-        for i in range(num_samples):
-            data.append(alpaca_data[i]['conversations'][0]['value'])
+    dataset_name = "tasksource/bigbench"
+    names = list(dataset_list.keys())
+    all_inputs = []
+    for name in names:
+        print(name)
+        all_inputs.append(load_dataset(dataset_name, name))
+    train_all_inputs = []
+    # valid_all_inputs = []
+    for dataset in all_inputs:
+        train_all_inputs += [text for text in dataset["train"]["inputs"]]
+        # valid_all_inputs += [text for text in dataset["validation"]["inputs"]]
+    return train_all_inputs
 
-    # sst2
-    if 'sst2' in dataset_list:
-        sst2_data = load_dataset("stanfordnlp/sst2")['train'] # contain 67349 samples
-        prefix_for_sst2 = '''For each given sentence, determine the sentiment expressed. If the sentiment is positive, return "positive". If the sentiment is negative, return "negative". Consider only these two categories for sentiment analysis. Please analyze the sentiment of the following sentence:'''
-        num_samples = dataset_list['sst2']
-        for i in range(num_samples):
-            data.append(prefix_for_sst2 + sst2_data[i]['sentence'])
-
-    # mrpc
-    if 'mrpc' in dataset_list:
-        mrpc_data  = load_dataset("SetFit/mrpc")["train"] # contain 3668 samples
-        prefix_for_mrpc = '''Given two sentences, determine whether they express the same meaning. If they are paraphrases of each other, return "equivalent". If they are not, return "not equivalent". Please evaluate the following sentence pair:\n
-        Sentence 1: "{}"
-        Sentence 2: "{}"'''
-        num_samples = dataset_list['mrpc']
-        for i in range(num_samples):
-            sample = mrpc_data[i]
-            data.append(prefix_for_mrpc.format(sample['text1'], sample['text2']))
-
-    # # yizhongw/self_instruct
-    if 'yizhongw' in dataset_list:
-        dataset = load_dataset("yizhongw/self_instruct", "super_natural_instructions")
-        data_prompts = dataset['train']['prompt']
-        num_samples = dataset_list['yizhongw']
-        for i in range(num_samples):
-            data.append(data_prompts[i])
-
-    if 'tick666-math' in dataset_list:
-        dataset = load_dataset("TICK666/Basic-Math-Chinese-1M-V1.1")['train'] # contains 1000000 samples
-        num_samples = dataset_list['tick666-math']
-        for i in range(num_samples):
-            data.append(dataset[i]['text'])
-    print(f"The data contains {len(data)} samples.")
-    return data
-
-def prepare_model(device):
-    print(f'Building and Loading a MoE model...')
-    quantized_model_name = "lavawolfiee/Mixtral-8x7B-Instruct-v0.1-offloading-demo"
-    state_path = "/home/nus-hx/code/offloadMoE/data"
-
-    config = AutoConfig.from_pretrained(quantized_model_name)
-    ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
-    offload_per_layer = 4
-    # offload_per_layer = 5
-    ###############################################################
-
-    num_experts = config.num_local_experts
-    offload_config = OffloadConfig(
-        main_size=config.num_hidden_layers * (num_experts - offload_per_layer),
-        offload_size=config.num_hidden_layers * offload_per_layer,
-        buffer_size=4,
-        offload_per_layer=offload_per_layer,
-    )
-
-    attn_config = BaseQuantizeConfig(
-        nbits=4,
-        group_size=64,
-        quant_zero=True,
-        quant_scale=True,
-    )
-    attn_config["scale_quant_params"]["group_size"] = 256
-    ffn_config = BaseQuantizeConfig(
-        nbits=2,
-        group_size=16,
-        quant_zero=True,
-        quant_scale=True,
-    )
-    quant_config = QuantConfig(ffn_config=ffn_config, attn_config=attn_config)
-
-    model = build_model(
-        device=device,
-        quant_config=quant_config,
-        offload_config=offload_config,
-        state_path=state_path,
-    )
-    return model
-    
 
 def main(args):
     if os.environ.get('ipdb', False):
         from ipdb import set_trace
         set_trace()
     dataset_list = {
-        'alpaca': 2000,
-        # 'sst2': 1000,
-        # 'mrpc': 1000,
-        # 'tick666-math': 1000,
-        # 'yizhongw': 1000
+        "auto_categorization": 328,
+        "tense": 286,
+        "disfl_qa": 8000,
+        "semantic_parsing_in_context_sparc": 1160,
+        "word_sorting": 1900,
+        "linguistics_puzzles": 2000,
     }
     print(f'Building dataset including {dataset_list}')
     data = prepare_data(dataset_list)
@@ -129,11 +59,18 @@ def main(args):
     batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
 
     device = torch.device("cuda:0")
-    model = prepare_model(device)
-    model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-    max_new_tokens = 64
+    model_name = "google/switch-base-16"
+    state_path='/home/nus-hx/.cache/huggingface/hub/models--google--switch-base-16/snapshots/0ef7d88ed50ec5f2cfdc019e81cef04d19700f8f'
+    model = build_offload_model(
+        offload_per_layer=12,
+        buffer_size= 6,
+        state_path=state_path,
+        model_name=model_name,
+        device=device
+    )
+    model = model.to(device)
+    max_new_tokens = 2
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
 
     ###### baseline: original implementation
     if args.task == 0:
@@ -164,10 +101,12 @@ def run_benchmark(model, tokenizer, batches, max_new_tokens, device):
         batch = batch.tolist()
         data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
         data = {key: val.to(device) for key, val in data.items()}
+        data['decoder_input_ids'] = torch.zeros(
+            (data['input_ids'].shape[0],1), dtype=torch.long, device=device)
         num_tokens.append(data['input_ids'].numel())
         batch_start = time.time()
         generated_token_ids, router_logits = custom_generate(
-            data['input_ids'], data['attention_mask'], model, max_new_tokens=max_new_tokens, predictor=None
+            **data, model=model, max_new_tokens=max_new_tokens
         )
         batch_end = time.time()
     torch.cuda.synchronize()
@@ -251,78 +190,69 @@ def prefetch_experts_by_predictor(model, input_ids, attention_mask, predictor):
 
 def custom_generate(
     input_ids,
+    decoder_input_ids,
     attention_mask,
     model,
     max_new_tokens=128,
     past_key_values=None,
     temperature=0.9,
-    top_p=0.9,
-    predictor=None
+    top_p=0.9
 ):
-    """
-    Generate text from an input using caching and sampling techniques.
+    def top_p_filtering(logits, top_p=0.9):
+        """
+        Filter a distribution of logits using nucleus (top-p) sampling
 
-    Args:
-    input_ids (torch.Tensor): Tensor of token ids to be fed to the model.
-    attention_mask (torch.Tensor): Tensor representing the attention mask.
-    model (transformers.PreTrainedModel): The model to use for generating text.
-    tokenizer (transformers.PreTrainedTokenizer): Tokenizer associated with the model.
-    max_new_tokens (int): Maximum number of tokens to generate.
-    temperature (float): Sampling temperature for controlling generation randomness.
-    top_p (float): Nucleus sampling cutoff probability.
+        Args:
+        logits (torch.Tensor): The logits output by the model.
+        top_p (float): The cumulative probability cutoff for nucleus sampling.
 
-    Returns:
-    torch.Tensor: Tensor containing the generated token ids.
-    """
+        Returns:
+        torch.Tensor: The filtered logits.
+        """
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # Remove tokens with cumulative probability above the threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
+        # Shift the indices to the right to keep the first token above the threshold
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+
+        # Scatter sorted tensors to original indexing
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits[indices_to_remove] = float('-inf')
+        return logits
+
+    # 初始化生成的令牌列表和past_key_values（用于存储注意力层的状态，加速和优化生成）
+    generated_tokens = []
+    past = past_key_values
     model.eval()  # Put model in evaluation mode
     with torch.no_grad():  # Disable gradient calculation
-        # Initialize variables to store outputs and past_key_values
-        generated_token_ids = input_ids
-        crt_tokens = input_ids
-        router_logits = []
+        for step in range(max_new_tokens):
+            outputs = model(input_ids=input_ids,
+                            decoder_input_ids=decoder_input_ids,
+                            attention_mask=attention_mask,
+                            past_key_values=past,
+                            output_router_logits=True,
+                            use_cache=True)  # use_cache允许模型返回past_key_values
+            # print(f"Step{step}: encoder-{outputs.encoder_router_logits[1][0].shape} decoder-{outputs.decoder_router_logits[1][0].shape}")
+            # 获取输出中的下一个token logits和更新past_key_values
+            next_token_logits = outputs.logits[:, -1, :]
+            past = outputs.past_key_values
 
-        for _ in range(max_new_tokens):
-            if predictor is not None:
-                prefetch_experts_by_predictor(
-                    model, generated_token_ids, attention_mask, predictor
-                )
-            outputs = model(
-                input_ids=crt_tokens,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                output_router_logits=True,
-                use_cache=True  # Informs the model to return past key-values
-            )
+            # 应用temperature来调整预测分布
+            next_token_logits = next_token_logits / temperature
+            filtered_logits = top_p_filtering(next_token_logits, top_p)
+            probs = torch.nn.functional.softmax(filtered_logits, dim=-1)
 
-            # Update past_key_values for the next iteration
-            past_key_values = outputs.past_key_values
+            # 随机选择一个令牌
+            next_token = torch.multinomial(probs, 1) # (batch_size , 1)
+            # 将生成的令牌添加到列表和解码器输入中
+            generated_tokens.append(next_token)
+            decoder_input_ids = torch.cat([decoder_input_ids, next_token], dim=-1)
 
-            # Obtain logits
-            logits = outputs.logits[:, -1, :] / temperature
+        return torch.cat(generated_tokens, dim=-1), (outputs.encoder_router_logits, outputs.decoder_router_logits)
 
-            # Apply top-p nucleus sampling
-            if top_p is not None:
-                filtered_logits = top_p_filtering(logits, top_p=top_p)
-            else:
-                filtered_logits = logits
-            probabilities = torch.nn.functional.softmax(filtered_logits, dim=-1)
-
-            # Sample from the filtered distribution
-            next_token_id = torch.multinomial(probabilities, num_samples=1)
-            crt_tokens = next_token_id
-            generated_token_ids = torch.cat((generated_token_ids, next_token_id), dim=1)
-
-            # Update the attention_mask for new token
-            attention_mask = torch.cat([attention_mask, torch.ones((input_ids.size(0), 1), device=attention_mask.device)], dim=-1)
-            router_logits.append(outputs.router_logits)
-
-        merged_router_logits = []
-        num_layers = len(router_logits[0])
-        for i in range(num_layers):
-            layer_logits = [logit[i] for logit in router_logits]
-            merged_logits = torch.cat(layer_logits, dim=0)
-            merged_router_logits.append(merged_logits)
-        return generated_token_ids, merged_router_logits
 
 
 def top_p_filtering(logits, top_p=0.9):
@@ -501,7 +431,17 @@ def test_custom_generate():
     
 if __name__ == '__main__':
     import argparse
+    import torch.distributed as dist
+    from accessory.util import misc
+    import fairscale.nn.model_parallel.initialize as fs_init
+    from glob import glob
+    
+    def init_env():
+        # define the model
+        misc.init_distributed_mode()
+        fs_init.initialize_model_parallel(dist.get_world_size())
 
+    init_env()
     # 创建 ArgumentParser 对象
     parser = argparse.ArgumentParser(description='Benchmark on a single GPU')
 
@@ -517,3 +457,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
     main(args)
     # test_custom_generate()
+
+# torchrun --nproc_per_node=1 --master_port=26173  benchmark_single_gpu_switch.py --task 0

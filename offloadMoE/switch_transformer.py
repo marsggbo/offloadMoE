@@ -1961,7 +1961,14 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
         return encoder_outputs
 
 
-def build_offload_model(config=None):
+def build_offload_model(
+    offload_per_layer: int=12,
+    buffer_size:int = 6,
+    state_path: str='/home/nus-hx/.cache/huggingface/hub/models--google--switch-base-16/snapshots/0ef7d88ed50ec5f2cfdc019e81cef04d19700f8f',
+    model_name="google/switch-base-16",
+    device = torch.device("cuda:0"),
+    config=None
+):
     
     from offloadMoE.expert_cache import ExpertCache
     from offloadMoE.custom_layers import SparseMoeWrapper
@@ -2184,31 +2191,20 @@ def build_offload_model(config=None):
                 layer.weight.data.copy_(w_to_load)
         return SwitchExpertWrapper(expert, device)
 
-    device = torch.device("cuda:0")
-    model_name = "google/switch-base-16"
     if config is None:
         config = AutoConfig.from_pretrained(
             model_name,
-            # num_experts=16,
             torch_dtype=torch.bfloat16,
             device_map=device,
         )
         config.offload = True
-      
-    # config.num_hidden_layers = 2
-    # config.num_decoder_layers = 2
-    state_path = '/home/nus-hx/.cache/huggingface/hub/models--google--switch-base-16/snapshots/0ef7d88ed50ec5f2cfdc019e81cef04d19700f8f'
-    ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
-    offload_per_layer = 12
-    # offload_per_layer = 5
-    ###############################################################
 
     num_experts = config.num_experts
     num_expert_layers = config.num_hidden_layers//config.encoder_sparse_step+config.num_decoder_layers//config.decoder_sparse_step
     offload_config = OffloadConfig(
         main_size=num_expert_layers * (num_experts - offload_per_layer),
         offload_size=num_expert_layers * offload_per_layer,
-        buffer_size=4,
+        buffer_size=buffer_size,
         offload_per_layer=offload_per_layer,
     )
 
