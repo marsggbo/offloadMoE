@@ -14,7 +14,8 @@ class ExpertInfo:
     uid: ExpertUID
     eviction_group: int
     offloaded: bool
-    index: int
+    gpu_index: int
+    cpu_index: int
 
 
 @dataclass
@@ -50,6 +51,12 @@ class EvictionGroupInfo:
             self.misses += 1
         else:
             raise ValueError(f"Expert {info} not in group")
+        
+    def expert_in_gpu(self):
+        experts = []
+        for uid, info in self.main_infos.items():
+            experts.append(info)
+        return experts
 
 
 class ExpertCache:
@@ -254,3 +261,148 @@ class ExpertCache:
             #     failed_uids = [e.uid for e in cpu2gpu_infos]
             #     print(f"Layer{layer_id} has {len(cpu2gpu_infos)} experts {failed_uids} that cannot be preloaded.")
                     
+class ExpertCacheV1(object):
+    def __init__(self, make_module: callable, main_size: int, offload_size: int, buffer_size: int, num_layer: int):
+        """Dynamically loads an array of modules with identical hyperparameters"""
+        self.module_type = self.module_size = self.device = None
+        self.active = False
+
+        self.registered_experts: Dict[ExpertUID, ExpertInfo] = dict()
+
+        self.main_modules = [self._check_module(make_module()) for i in range(main_size)]
+        self.main_infos: List[Optional[ExpertInfo]] = [None for _ in range(main_size)]
+
+        assert self.module_size is not None
+        self.offloaded_storages = [
+            torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(offload_size)]
+        self.offloaded_infos: List[Optional[ExpertInfo]] = [None for _ in range(offload_size)]
+
+        # temporary storage to shave off latency
+        self.device_expert_buffers = deque([self._check_module(make_module()) for _ in range(buffer_size)])
+        self.offloaded_storage_buffers = deque([
+            torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(buffer_size)])
+        self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(EvictionGroupInfo)
+
+        self.prefetch_stream = torch.cuda.Stream()
+        self.ondemand_stream = torch.cuda.Stream()
+
+        self.event_queue = [None] * num_layer
+
+    def _check_module(self, module: MixtralExpertWrapper):
+        assert isinstance(module.storage, torch.UntypedStorage)
+        if self.module_type is None:
+            self.module_type = type(module)
+            self.module_size = len(module.storage)
+            self.device = module.storage.device
+        else:
+            assert isinstance(module, self.module_type)
+            assert len(module.storage) == self.module_size
+            assert module.storage.device == self.device
+        return module
+
+    def add_expert(self, uid: ExpertUID, module: MixtralExpertWrapper, eviction_group: int = 0,
+                   offload: Optional[bool] = None):
+        """Register an expert to the cache and associate it with uid"""
+        assert self.module_type is not None
+        assert isinstance(module, self.module_type)
+        return self.add_expert_storage(uid, module.storage, eviction_group=eviction_group, offload=offload)
+    
+    def add_expert_storage(self, uid: ExpertUID, storage: torch.UntypedStorage,
+                           eviction_group: int = 0, offload: Optional[bool] = None):
+        assert uid not in self.registered_experts, f"expert {uid} already registered"
+        assert isinstance(storage, torch.UntypedStorage)
+        assert len(storage) == self.module_size
+
+        if offload is None or not offload:  # False or None
+            for i in range(len(self.main_modules)):
+                if self.main_infos[i] is None:
+                    self.main_modules[i].storage.copy_(storage)
+                    info = ExpertInfo(uid, eviction_group=eviction_group, offloaded=False, gpu_index=i, cpu_index=-1)
+                    self.registered_experts[uid] = self.main_infos[i] = info
+                    self.group_infos[eviction_group].add(info)
+                    break  # done allocating; found spot on device
+            
+            # We always keep a copy in CPU
+            for i in range(len(self.offloaded_storages)):
+                if self.offloaded_infos[i] is None:
+                    self.offloaded_storages[i].copy_(storage)
+                    self.registered_experts[uid].cpu_index = i
+                    self.offloaded_infos[i] = info
+                    return
+            
+        if offload is None or offload:  # True or None
+            for i in range(len(self.offloaded_storages)):
+                if self.offloaded_infos[i] is None:
+                    self.offloaded_storages[i].copy_(storage)
+                    info = ExpertInfo(uid, eviction_group=eviction_group, offloaded=True, gpu_index=-1, cpu_index=i)
+                    self.registered_experts[uid] = self.offloaded_infos[i] = info
+                    self.group_infos[eviction_group].add(info)
+        raise ValueError("Cache is full")
+    
+    def _swap(self, info_to_load: ExpertInfo, info_to_evict: ExpertInfo) -> nn.Module:
+        assert info_to_load.eviction_group == info_to_evict.eviction_group
+
+        self.main_modules[info_to_evict.gpu_index].storage.copy_(self.offloaded_storages[info_to_load.cpu_index], non_blocking=True)
+        self.main_infos[info_to_evict.gpu_index] = info_to_load
+        
+        info_to_evict.offloaded, info_to_load.offloaded = info_to_load.offloaded, info_to_evict.offloaded
+        info_to_load.gpu_index = info_to_evict.gpu_index
+        info_to_evict.gpu_index = -1
+        self.group_infos[info_to_load.eviction_group].swap(info_to_load, info_to_evict)
+        
+    def load_experts(
+            self, *uids: ExpertUID, unordered: bool = False) -> Iterator[Tuple[ExpertUID, MixtralExpertWrapper]]:
+        assert len(set(uids)) == len(uids)
+        assert not self.active, "already loading experts; buffers are busy"
+        if unordered:
+            uids = sorted(uids, key=lambda uid: self.registered_experts[uid].offloaded)
+        infos = [self.registered_experts[uid] for uid in uids]
+
+        assert len(set(info.eviction_group for info in infos)) == 1, "experts must be in the same evicton group"
+        eviction_group = self.group_infos[infos[0].eviction_group]
+        for info in infos:
+            eviction_group.mark_used(info)
+        
+        try:
+            self.active = True
+        finally:
+            self.active = False
+    
+    def prefetch(self, pattern: torch.Tensor):
+        num_layers, num_experts = pattern.shape
+
+        for layer_id in range(num_layers):
+            cpu2gpu_infos = []
+            eviction_group = None
+
+            for expert_id in range(num_experts):
+                uid: ExpertUID = (layer_id, expert_id)
+                info = self.registered_experts.get(uid)
+
+                assert info is not None, "Unregonized Expert!"
+                required_on_gpu = pattern[layer_id, expert_id] == 1
+
+                if required_on_gpu and info.offloaded:
+                    cpu2gpu_infos.append(info)
+                
+                if eviction_group is None:
+                    eviction_group = self.group_infos[info.eviction_group]
+            
+            # Get evict expert
+            expert_in_gpu = eviction_group.expert_in_gpu()
+            evict_experts = []
+            for expert_info in expert_in_gpu:
+                layer_id, expert_id = expert_info.uid
+                if pattern[layer_id, expert_id] == 0:
+                    evict_experts.append(expert_info)
+
+            while cpu2gpu_infos and evict_experts:
+                info_to_load = cpu2gpu_infos.pop()
+                info_to_evict = evict_experts.pop()
+
+                with torch.cuda.stream(self.prefetch_stream):
+                    self._swap(info_to_load, info_to_evict)
+
+            with torch.cuda.stream(self.prefetch_stream):
+                self.event_queue[layer_id] = torch.cuda.Event()
+                self.event_queue[layer_id].record()
