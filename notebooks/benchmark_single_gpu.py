@@ -143,8 +143,8 @@ def main(args):
     batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
 
     device = torch.device("cuda:0")
-    # model = prepare_model(device, offload_per_layer=4, buffer_size=4)
-    model = build_offload_model(offload_per_layer=4, buffer_size=4)
+    model = prepare_model(device, offload_per_layer=4, buffer_size=4)
+    # model = build_offload_model(offload_per_layer=4, buffer_size=4)
     model = model.to(device)
     model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
     max_new_tokens = 8
@@ -211,18 +211,34 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
         generated_token_ids, router_logits = custom_generate(
             data['input_ids'], data['attention_mask'], model, max_new_tokens=max_new_tokens, predictor=None
         )
-        token_pattern_matrices_list = []
-        for layer in model.modules():
-            if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
-                token_pattern_matrices_list.append(layer.token_pattern_mask) # (bs, seq_len, num_experts)
-        token_pattern_matrices_list = torch.stack(token_pattern_matrices_list, dim=-2) # (bs, seq_len, num_layers, num_experts)
+        bs, seq_len = generated_token_ids.shape
+        num_layers = len(router_logits)
+        token_pattern_matrices_logits = torch.stack(router_logits, dim=-2) # (num_tokens, num_layers, num_experts)
+        token_pattern_matrices_logits = token_pattern_matrices_logits.view(bs, seq_len-1, num_layers, -1) # (bs, seq_len, num_layers, num_experts)
+        
+        ####################################################
+        # 将router logits转换成one-hot pattern matrix
+        ####################################################
+        # Step 1: 获取每行 top-2 的索引
+        _, top2_indices = torch.topk(token_pattern_matrices_logits, 2, dim=-1)
+        # Step 2: 创建一个初始全为 0 的张量
+        token_pattern_matrices = torch.zeros_like(token_pattern_matrices_logits)
+        # Step 3: 使用高级索引将 top-2 位置设置为 1
+        # 构建批量索引
+        batch_size, seq_len, num_layers, _ = token_pattern_matrices_logits.shape
+        bs_indices = torch.arange(batch_size)[:, None, None, None].expand(-1, seq_len, num_layers, 2) # (bs, seq, num_layers, 2)
+        seq_indices = torch.arange(seq_len)[None, :, None, None].expand(batch_size, -1, num_layers, 2)
+        layer_indices = torch.arange(num_layers)[None, None, :, None].expand(batch_size, seq_len, -1, 2)
+        # Step 4: 将 top-2 位置设置为 1
+        token_pattern_matrices[bs_indices, seq_indices, layer_indices, top2_indices] = 1
+
         for i, text in enumerate(batch):
             pattern_matrices[len(batch)*batch_idx+i] = {
                 'prompt_text': text,
                 'prompt_token_ids': data['input_ids'][i].cpu(),
                 'prompt_attention_mask': data['attention_mask'][i].cpu(),
-                'token_ids': generated_token_ids[i].detach().cpu(),
-                'token_pattern_matrices': token_pattern_matrices_list[i]
+                'token_ids': generated_token_ids[i].detach().cpu()[:-1],
+                'token_pattern_matrices': token_pattern_matrices[i]
             }
         for layer in model.modules():
             if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
