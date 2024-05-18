@@ -4,6 +4,7 @@ import time
 import os
 import torch
 import json
+from types import SimpleNamespace
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer
 from datasets import load_dataset
@@ -12,6 +13,7 @@ from transformers import TextStreamer
 from hqq.core.quantize import BaseQuantizeConfig
 from offloadMoE.build_model import OffloadConfig, QuantConfig, build_model
 from offloadMoE.custom_layers import SparseMoeWrapper
+from offloadMoE.modeling_mixtral import build_offload_model
 
 
 def load_json(file):
@@ -109,18 +111,8 @@ def prepare_model(
     return model
     
 
-def main(args):
-    from offloadMoE.modeling_mixtral import build_offload_model
-    import torch.distributed as dist
-    from accessory.util import misc
-    import fairscale.nn.model_parallel.initialize as fs_init
-    
-    def init_env():
-        # define the model
-        misc.init_distributed_mode()
-        fs_init.initialize_model_parallel(dist.get_world_size())
 
-    init_env()
+def main(args):
     if os.environ.get('ipdb', False):
         from ipdb import set_trace
         set_trace()
@@ -221,17 +213,18 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
         # 将router logits转换成one-hot pattern matrix
         ####################################################
         # Step 1: 获取每行 top-2 的索引
-        _, top2_indices = torch.topk(token_pattern_matrices_logits, 2, dim=-1)
+        topk = 2
+        _, topk_indices = torch.topk(token_pattern_matrices_logits, topk, dim=-1)
         # Step 2: 创建一个初始全为 0 的张量
         token_pattern_matrices = torch.zeros_like(token_pattern_matrices_logits)
         # Step 3: 使用高级索引将 top-2 位置设置为 1
         # 构建批量索引
         batch_size, seq_len, num_layers, _ = token_pattern_matrices_logits.shape
-        bs_indices = torch.arange(batch_size)[:, None, None, None].expand(-1, seq_len, num_layers, 2) # (bs, seq, num_layers, 2)
-        seq_indices = torch.arange(seq_len)[None, :, None, None].expand(batch_size, -1, num_layers, 2)
-        layer_indices = torch.arange(num_layers)[None, None, :, None].expand(batch_size, seq_len, -1, 2)
+        bs_indices = torch.arange(batch_size)[:, None, None, None].expand(-1, seq_len, num_layers, topk) # (bs, seq, num_layers, topk)
+        seq_indices = torch.arange(seq_len)[None, :, None, None].expand(batch_size, -1, num_layers, topk)
+        layer_indices = torch.arange(num_layers)[None, None, :, None].expand(batch_size, seq_len, -1, topk)
         # Step 4: 将 top-2 位置设置为 1
-        token_pattern_matrices[bs_indices, seq_indices, layer_indices, top2_indices] = 1
+        token_pattern_matrices[bs_indices, seq_indices, layer_indices, topk_indices] = 1
 
         for i, text in enumerate(batch):
             pattern_matrices[len(batch)*batch_idx+i] = {
@@ -241,9 +234,6 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
                 'token_ids': generated_token_ids[i].detach().cpu()[:-1],
                 'token_pattern_matrices': token_pattern_matrices[i]
             }
-        for layer in model.modules():
-            if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
-                layer.token_pattern_mask = None
     torch.save(pattern_matrices, 'pattern_matrices.pt')
     return pattern_matrices
 
@@ -531,8 +521,60 @@ def test_custom_generate():
     print(tokenizer.batch_decode(generated_token_ids.cpu().numpy().tolist(), skip_special_tokens=True))
 
     
+def init_distributed_mode(args=SimpleNamespace()):
+    def find_free_port(start_port: int, end_port: int):
+        """
+        Find a free port within the specified range.
+        """
+        for port in range(start_port, end_port):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", port))  # Try to bind to the port
+                s.close()  # Close the socket if successful
+                return port
+            except OSError as e:
+                # print(f"Port {port} is in use, trying next port.")
+                continue
+        raise RuntimeError(f"No free ports found in range {start_port}-{end_port}")
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and "LOCAL_RANK" in os.environ:
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.rank = int(os.environ["RANK"])
+        args.gpu = int(os.environ['LOCAL_RANK'])
+        args.local_rank = args.gpu
+        args.dist_url = 'env://'
+    else:
+        os.environ['MASTER_ADDR'] = "127.0.0.1"
+        os.environ['MASTER_PORT'] = str(find_free_port(9000, 10000))
+        os.environ['RANK'] = '0'
+        os.environ['LOCAL_RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        args.rank = 0
+        args.gpu = args.local_rank = 0
+        args.world_size = 1
+        args.dist_url = 'env://'
+
+    args.distributed = True
+
+    torch.cuda.set_device(args.gpu)
+    args.dist_backend = 'nccl'
+    print('| distributed init (rank {}): {}, gpu {}'.format(
+        args.rank, args.dist_url, args.gpu), flush=True)
+    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                         world_size=args.world_size, rank=args.rank)
+    torch.distributed.barrier()
+
+
 if __name__ == '__main__':
     import argparse
+    import torch.distributed as dist
+    import fairscale.nn.model_parallel.initialize as fs_init
+    
+    def init_env():
+        # define the model
+        init_distributed_mode()
+        fs_init.initialize_model_parallel(dist.get_world_size())
+
+    init_env()
 
     # 创建 ArgumentParser 对象
     parser = argparse.ArgumentParser(description='Benchmark on a single GPU')
