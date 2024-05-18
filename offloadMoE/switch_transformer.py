@@ -2020,7 +2020,6 @@ def build_offload_model(
             self.layer_id = layer_id
             self.router = gate
             self.experts = expert_cache
-            self.token_pattern_mask = None
     
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             router_mask, router_probs, router_logits = self.router(hidden_states)

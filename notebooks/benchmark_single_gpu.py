@@ -4,6 +4,7 @@ import time
 import os
 import torch
 import json
+from types import SimpleNamespace
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer
 from datasets import load_dataset
@@ -12,6 +13,7 @@ from transformers import TextStreamer
 from hqq.core.quantize import BaseQuantizeConfig
 from offloadMoE.build_model import OffloadConfig, QuantConfig, build_model
 from offloadMoE.custom_layers import SparseMoeWrapper
+from offloadMoE.modeling_mixtral import build_offload_model
 
 
 def load_json(file):
@@ -109,18 +111,8 @@ def prepare_model(
     return model
     
 
-def main(args):
-    from offloadMoE.modeling_mixtral import build_offload_model
-    import torch.distributed as dist
-    from accessory.util import misc
-    import fairscale.nn.model_parallel.initialize as fs_init
-    
-    def init_env():
-        # define the model
-        misc.init_distributed_mode()
-        fs_init.initialize_model_parallel(dist.get_world_size())
 
-    init_env()
+def main(args):
     if os.environ.get('ipdb', False):
         from ipdb import set_trace
         set_trace()
@@ -143,8 +135,8 @@ def main(args):
     batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
 
     device = torch.device("cuda:0")
-    # model = prepare_model(device, offload_per_layer=4, buffer_size=4)
-    model = build_offload_model(offload_per_layer=4, buffer_size=4)
+    model = prepare_model(device, offload_per_layer=4, buffer_size=4)
+    # model = build_offload_model(offload_per_layer=4, buffer_size=4)
     model = model.to(device)
     model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
     max_new_tokens = 8
@@ -161,7 +153,6 @@ def main(args):
 
     ###### Idea: run with ground truth of pattern matrices
     elif args.task == 2:
-        os.environ['TRACE_PATTERN'] = "1"
         pattern_matrices = torch.load(args.pattern_matrices_path)
         run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, device, pattern_matrices)
 
@@ -198,7 +189,9 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
     pattern_matrices = {
         # 0: {
         #     'prompt_text': "this is a prompt",
+        #     'prompt_token_ids': ,
         #     'token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
+        #     'prompt_attention_mask': ,
         #     'token_pattern_matrices': # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
         # },
         # 1: {},
@@ -211,22 +204,36 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
         generated_token_ids, router_logits = custom_generate(
             data['input_ids'], data['attention_mask'], model, max_new_tokens=max_new_tokens, predictor=None
         )
-        token_pattern_matrices_list = []
-        for layer in model.modules():
-            if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
-                token_pattern_matrices_list.append(layer.token_pattern_mask) # (bs, seq_len, num_experts)
-        token_pattern_matrices_list = torch.stack(token_pattern_matrices_list, dim=-2) # (bs, seq_len, num_layers, num_experts)
+        bs, seq_len = generated_token_ids.shape
+        num_layers = len(router_logits)
+        token_pattern_matrices_logits = torch.stack(router_logits, dim=-2) # (num_tokens, num_layers, num_experts)
+        token_pattern_matrices_logits = token_pattern_matrices_logits.view(bs, seq_len-1, num_layers, -1) # (bs, seq_len, num_layers, num_experts)
+        
+        ####################################################
+        # 将router logits转换成one-hot pattern matrix
+        ####################################################
+        # Step 1: 获取每行 top-2 的索引
+        topk = 2
+        _, topk_indices = torch.topk(token_pattern_matrices_logits, topk, dim=-1)
+        # Step 2: 创建一个初始全为 0 的张量
+        token_pattern_matrices = torch.zeros_like(token_pattern_matrices_logits)
+        # Step 3: 使用高级索引将 top-2 位置设置为 1
+        # 构建批量索引
+        batch_size, seq_len, num_layers, _ = token_pattern_matrices_logits.shape
+        bs_indices = torch.arange(batch_size)[:, None, None, None].expand(-1, seq_len, num_layers, topk) # (bs, seq, num_layers, topk)
+        seq_indices = torch.arange(seq_len)[None, :, None, None].expand(batch_size, -1, num_layers, topk)
+        layer_indices = torch.arange(num_layers)[None, None, :, None].expand(batch_size, seq_len, -1, topk)
+        # Step 4: 将 top-2 位置设置为 1
+        token_pattern_matrices[bs_indices, seq_indices, layer_indices, topk_indices] = 1
+
         for i, text in enumerate(batch):
             pattern_matrices[len(batch)*batch_idx+i] = {
                 'prompt_text': text,
                 'prompt_token_ids': data['input_ids'][i].cpu(),
                 'prompt_attention_mask': data['attention_mask'][i].cpu(),
-                'token_ids': generated_token_ids[i].detach().cpu(),
-                'token_pattern_matrices': token_pattern_matrices_list[i]
+                'token_ids': generated_token_ids[i].detach().cpu()[:-1],
+                'token_pattern_matrices': token_pattern_matrices[i]
             }
-        for layer in model.modules():
-            if isinstance(layer, SparseMoeWrapper):  # Check if the layer is a MoE layer
-                layer.token_pattern_mask = None
     torch.save(pattern_matrices, 'pattern_matrices.pt')
     return pattern_matrices
 
@@ -373,8 +380,6 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
             layer.block_sparse_moe.experts.prefetch(pattern_matrix)
             break
 
-    get_batch_data = lambda key, batch: torch.stack([batch[i][key] for i in range(len(batch))], dim=0)
-
     def create_attention_mask(token_ids):
         # token_ids 是一个 (num_samples, seq_len) 的 PyTorch 张量
         seq_len = token_ids.size(1)
@@ -398,6 +403,7 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
         top_p=0.9,
     ):
         model.eval()  # Put model in evaluation mode
+        get_batch_data = lambda key, batch: torch.stack([batch[i][key] for i in range(len(batch))], dim=0)
         num_layers, num_experts = batch[0]['token_pattern_matrices'].shape[-2:]
         all_pattern_matrices = get_batch_data('token_pattern_matrices', batch) # (num_samples, prompt_len, 32, 8)
         all_token_ids = get_batch_data('token_ids', batch) # (num_samples, prompt_len+decoding_len)
@@ -415,10 +421,10 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
                     pattern_matrix = pattern_matrices.sum(0).sum(0) # (32, 8)
                     crt_tokens = all_token_ids[:, :prompt_len]
                     generated_token_ids = crt_tokens
-                    attention_mask = create_attention_mask(crt_tokens)
+                    attention_mask = get_batch_data('prompt_attention_mask', batch).to(crt_tokens.device)
                 else:
                     # decoding
-                    pattern_matrices = all_pattern_matrices[:, prompt_len+token_index-1, :, :] # (num_samples, 1, 32, 8)
+                    pattern_matrices = all_pattern_matrices[:, prompt_len+token_index-1, :, :] # (num_samples, 32, 8)
                     pattern_matrix = pattern_matrices.sum(0) # (32, 8)
                     crt_tokens = all_token_ids[:, prompt_len+token_index-1].view(-1, 1)
                     attention_mask = torch.cat([attention_mask, torch.ones((len(batch), 1), device=attention_mask.device)], dim=-1)
@@ -459,7 +465,7 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
     #     0: {
     #         'prompt_text': "this is a prompt",
     #         'prompt_token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
-    #         'token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
+    #         'token_ids': [0, 2, 3, 56, 956, ...], # pad + prompt + decode
     #         'token_pattern_matrices': # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
     #     },
     #     1: {},
@@ -515,8 +521,60 @@ def test_custom_generate():
     print(tokenizer.batch_decode(generated_token_ids.cpu().numpy().tolist(), skip_special_tokens=True))
 
     
+def init_distributed_mode(args=SimpleNamespace()):
+    def find_free_port(start_port: int, end_port: int):
+        """
+        Find a free port within the specified range.
+        """
+        for port in range(start_port, end_port):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", port))  # Try to bind to the port
+                s.close()  # Close the socket if successful
+                return port
+            except OSError as e:
+                # print(f"Port {port} is in use, trying next port.")
+                continue
+        raise RuntimeError(f"No free ports found in range {start_port}-{end_port}")
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and "LOCAL_RANK" in os.environ:
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.rank = int(os.environ["RANK"])
+        args.gpu = int(os.environ['LOCAL_RANK'])
+        args.local_rank = args.gpu
+        args.dist_url = 'env://'
+    else:
+        os.environ['MASTER_ADDR'] = "127.0.0.1"
+        os.environ['MASTER_PORT'] = str(find_free_port(9000, 10000))
+        os.environ['RANK'] = '0'
+        os.environ['LOCAL_RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        args.rank = 0
+        args.gpu = args.local_rank = 0
+        args.world_size = 1
+        args.dist_url = 'env://'
+
+    args.distributed = True
+
+    torch.cuda.set_device(args.gpu)
+    args.dist_backend = 'nccl'
+    print('| distributed init (rank {}): {}, gpu {}'.format(
+        args.rank, args.dist_url, args.gpu), flush=True)
+    torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                         world_size=args.world_size, rank=args.rank)
+    torch.distributed.barrier()
+
+
 if __name__ == '__main__':
     import argparse
+    import torch.distributed as dist
+    import fairscale.nn.model_parallel.initialize as fs_init
+    
+    def init_env():
+        # define the model
+        init_distributed_mode()
+        fs_init.initialize_model_parallel(dist.get_world_size())
+
+    init_env()
 
     # 创建 ArgumentParser 对象
     parser = argparse.ArgumentParser(description='Benchmark on a single GPU')
