@@ -161,7 +161,6 @@ def main(args):
 
     ###### Idea: run with ground truth of pattern matrices
     elif args.task == 2:
-        os.environ['TRACE_PATTERN'] = "1"
         pattern_matrices = torch.load(args.pattern_matrices_path)
         run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, device, pattern_matrices)
 
@@ -198,7 +197,9 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
     pattern_matrices = {
         # 0: {
         #     'prompt_text': "this is a prompt",
+        #     'prompt_token_ids': ,
         #     'token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
+        #     'prompt_attention_mask': ,
         #     'token_pattern_matrices': # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
         # },
         # 1: {},
@@ -389,8 +390,6 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
             layer.block_sparse_moe.experts.prefetch(pattern_matrix)
             break
 
-    get_batch_data = lambda key, batch: torch.stack([batch[i][key] for i in range(len(batch))], dim=0)
-
     def create_attention_mask(token_ids):
         # token_ids 是一个 (num_samples, seq_len) 的 PyTorch 张量
         seq_len = token_ids.size(1)
@@ -414,6 +413,7 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
         top_p=0.9,
     ):
         model.eval()  # Put model in evaluation mode
+        get_batch_data = lambda key, batch: torch.stack([batch[i][key] for i in range(len(batch))], dim=0)
         num_layers, num_experts = batch[0]['token_pattern_matrices'].shape[-2:]
         all_pattern_matrices = get_batch_data('token_pattern_matrices', batch) # (num_samples, prompt_len, 32, 8)
         all_token_ids = get_batch_data('token_ids', batch) # (num_samples, prompt_len+decoding_len)
@@ -431,10 +431,10 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
                     pattern_matrix = pattern_matrices.sum(0).sum(0) # (32, 8)
                     crt_tokens = all_token_ids[:, :prompt_len]
                     generated_token_ids = crt_tokens
-                    attention_mask = create_attention_mask(crt_tokens)
+                    attention_mask = get_batch_data('prompt_attention_mask', batch).to(crt_tokens.device)
                 else:
                     # decoding
-                    pattern_matrices = all_pattern_matrices[:, prompt_len+token_index-1, :, :] # (num_samples, 1, 32, 8)
+                    pattern_matrices = all_pattern_matrices[:, prompt_len+token_index-1, :, :] # (num_samples, 32, 8)
                     pattern_matrix = pattern_matrices.sum(0) # (32, 8)
                     crt_tokens = all_token_ids[:, prompt_len+token_index-1].view(-1, 1)
                     attention_mask = torch.cat([attention_mask, torch.ones((len(batch), 1), device=attention_mask.device)], dim=-1)
@@ -475,7 +475,7 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
     #     0: {
     #         'prompt_text': "this is a prompt",
     #         'prompt_token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
-    #         'token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
+    #         'token_ids': [0, 2, 3, 56, 956, ...], # pad + prompt + decode
     #         'token_pattern_matrices': # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
     #     },
     #     1: {},
