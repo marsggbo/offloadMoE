@@ -70,20 +70,6 @@ def main(args):
     if args.task == 0:
         run_benchmark(model, tokenizer, batches, max_new_tokens, device)
 
-    ###### get pattern matrices of given batches of requests, including prefilling and decoding tokens
-    elif args.task ==1:
-        pattern_matrices = get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device)
-
-    ###### Idea: run with ground truth of pattern matrices
-    elif args.task == 2:
-        os.environ['TRACE_PATTERN'] = "1"
-        pattern_matrices = torch.load(args.pattern_matrices_path)
-        run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, device, pattern_matrices)
-
-    elif args.task == 3:
-        predictor = ...
-        run_benchmark_with_predictor(model, tokenizer, batches, max_new_tokens, device, predictor)
-
     else:
         raise NotImplementedError
 

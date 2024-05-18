@@ -125,7 +125,7 @@ def main(args):
         from ipdb import set_trace
         set_trace()
     dataset_list = {
-        'alpaca': 2000,
+        'alpaca': 256,
         # 'sst2': 1000,
         # 'mrpc': 1000,
         # 'tick666-math': 1000,
@@ -139,14 +139,15 @@ def main(args):
     # data = np.array(data)[indices]
     ###### length-sorted order
     data = np.array(sorted(data, key=len))
-    batch_size = 8
+    batch_size = 16
     batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
 
     device = torch.device("cuda:0")
-    model = prepare_model(device, offload_per_layer=4, buffer_size=4)
-    # model = build_offload_model(offload_per_layer=4, buffer_size=4)
+    # model = prepare_model(device, offload_per_layer=4, buffer_size=4)
+    model = build_offload_model(offload_per_layer=4, buffer_size=4)
+    model = model.to(device)
     model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-    max_new_tokens = 4
+    max_new_tokens = 8
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
 
