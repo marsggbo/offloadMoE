@@ -269,9 +269,11 @@ class ExpertCacheV1(object):
 
         self.registered_experts: Dict[ExpertUID, ExpertInfo] = dict()
 
+        print("Create main module list")
         self.main_modules = [self._check_module(make_module()) for i in range(main_size)]
         self.main_infos: List[Optional[ExpertInfo]] = [None for _ in range(main_size)]
 
+        print("Create offload storage list")
         assert self.module_size is not None
         self.offloaded_storages = [
             torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(offload_size)]
@@ -283,10 +285,14 @@ class ExpertCacheV1(object):
             torch.UntypedStorage(self.module_size).pin_memory(self.device) for _ in range(buffer_size)])
         self.group_infos: Dict[int, EvictionGroupInfo] = defaultdict(EvictionGroupInfo)
 
+        print("Group info ", self.group_infos)
+
         self.prefetch_stream = torch.cuda.Stream()
         self.ondemand_stream = torch.cuda.Stream()
 
-        self.event_queue = [None] * num_layer
+        self.num_layer = num_layer
+        print("Number layer ", num_layer)
+        self.event_queue = [None] * self.num_layer
 
     def _check_module(self, module: MixtralExpertWrapper):
         assert isinstance(module.storage, torch.UntypedStorage)
@@ -329,7 +335,7 @@ class ExpertCacheV1(object):
                     self.registered_experts[uid].cpu_index = i
                     self.offloaded_infos[i] = info
                     return
-            
+
         if offload is None or offload:  # True or None
             for i in range(len(self.offloaded_storages)):
                 if self.offloaded_infos[i] is None:
@@ -337,6 +343,7 @@ class ExpertCacheV1(object):
                     info = ExpertInfo(uid, eviction_group=eviction_group, offloaded=True, gpu_index=-1, cpu_index=i)
                     self.registered_experts[uid] = self.offloaded_infos[i] = info
                     self.group_infos[eviction_group].add(info)
+                    return
         raise ValueError("Cache is full")
     
     def _swap(self, info_to_load: ExpertInfo, info_to_evict: ExpertInfo) -> nn.Module:
@@ -371,7 +378,8 @@ class ExpertCacheV1(object):
     def prefetch(self, pattern: torch.Tensor):
         num_layers, num_experts = pattern.shape
 
-        for layer_id in range(num_layers):
+        # Only work for switch transformer
+        for layer_id in range(1, num_layers, 2):
             cpu2gpu_infos = []
             eviction_group = None
 
@@ -379,7 +387,7 @@ class ExpertCacheV1(object):
                 uid: ExpertUID = (layer_id, expert_id)
                 info = self.registered_experts.get(uid)
 
-                assert info is not None, "Unregonized Expert!"
+                assert info is not None, f"Unregonized Expert {uid}!"
                 required_on_gpu = pattern[layer_id, expert_id] == 1
 
                 if required_on_gpu and info.offloaded:
@@ -406,3 +414,13 @@ class ExpertCacheV1(object):
             with torch.cuda.stream(self.prefetch_stream):
                 self.event_queue[layer_id] = torch.cuda.Event()
                 self.event_queue[layer_id].record()
+    
+    def check_main_module(self, pattern):
+        for i in range(1, self.num_layer, 2):
+            print("Layer ID ", i)
+            eviction_group = self.group_infos[i]
+            expert_list = eviction_group.expert_in_gpu()
+            for expert in expert_list:
+                print(expert.uid)
+            print("******************")
+            print(torch.nonzero(pattern[i], as_tuple=False))

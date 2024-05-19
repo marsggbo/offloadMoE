@@ -1952,6 +1952,214 @@ def build_offload_model(
     print(model)
     return model
 
+def build_offload_model_v1(offload_per_layer=4,
+                           buffer_size=4,
+                           config=None):
+    from offloadMoE.expert_cache import ExpertCacheV1
+    from offloadMoE.custom_layers import SparseMoeWrapper
+    from offloadMoE.utils import nested_flatten, nested_pack, with_default_dtype
+    from dataclasses import dataclass
+    from transformers import AutoConfig
+    import json
+    import os
+    import typing as tp
+
+    class MixtralExpertWrapper(nn.Module):
+        def __init__(
+            self,
+            expert_module: tp.Any,
+            device: torch.device,
+        ):
+            super().__init__()
+            
+            self.expert_module, self.storage = self.replace_layer_storage(expert_module, device)
+            # self.expert_module = lambda *args, **kwargs: expert_module(*args, **kwargs)
+            
+            self._register_state_dict_hook(self._add_storage_to_state_dict_hook)
+            self._register_load_state_dict_pre_hook(self._load_storage_from_state_dict_hook)
+
+        @staticmethod
+        def _add_storage_to_state_dict_hook(self, state_dict, prefix, local_metadata):
+            state_dict[prefix + 'storage'] = torch.as_tensor(self.storage, dtype=torch.bfloat16)
+            return state_dict
+
+        def _load_storage_from_state_dict_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+            self.storage.copy_(state_dict[prefix + 'storage'].storage().untyped())
+            del state_dict[prefix + 'storage']
+
+        def forward(self, *args, **kwargs):
+            return self.expert_module(*args, **kwargs)
+
+        @staticmethod
+        def replace_layer_storage(
+            layer: tp.Any,
+            device: torch.device,
+        ):
+            '''
+            这个静态方法的目的是将传入的 layer（一个包含多个子层的模块）的所有张量转移到一个单一的 UntypedStorage 对象中。这样做的优点包括：
+            - 内存连续性：将所有小张量合并到一个大的连续内存块中，有助于减少内存碎片和提高缓存效率。
+            - 优化数据传输：在多设备环境下，如数据需要在 CPU 和 GPU 之间移动，使用单一的存储可以减少同步和数据传输的开销。
+            - 减少内存占用：相较于分散存储，连续存储往往可以更好地利用内存，减少总体占用空间。
+            '''
+            state_dict = {
+                f"w{i}": {
+                    "weight": getattr(layer, f"w{i}").weight,
+                }
+                for i in range(1, 4)
+            }
+
+            storage_size = 0
+            offsets = [0]
+
+            for x in nested_flatten(state_dict):
+                if not isinstance(x, torch.Tensor):
+                    continue
+                storage_size += x.nbytes
+                offsets.append(storage_size)
+
+            storage = torch.UntypedStorage(storage_size, device=device) 
+
+            i = 0
+            new_flattened_states = list()
+            for x in nested_flatten(state_dict):
+                if not isinstance(x, torch.Tensor):
+                    new_flattened_states.append(x)
+                    continue
+
+                start = offsets[i]
+                end = offsets[i + 1]
+                a_view = torch.as_tensor(storage[start:end], dtype=x.dtype, device=device).view(x.shape)
+                a_view[...] = x
+                assert a_view.data_ptr() == storage.data_ptr() + start
+                i += 1
+                new_flattened_states.append(a_view)
+
+            state_dict = nested_pack(new_flattened_states, state_dict)
+
+            for layer_id, states in state_dict.items():
+                patched = getattr(layer, layer_id)
+                patched.weight = nn.Parameter(states['weight'])
+                setattr(layer, layer_id, patched)
+
+            return layer, storage
+
+    @dataclass(frozen=True)
+    class OffloadConfig:
+        main_size: int
+        offload_size: int
+        buffer_size: int
+        offload_per_layer: int
+    
+    def make_empty_expert(model_config: MixtralConfig) -> MixtralBlockSparseTop2MLP:
+        return MixtralBlockSparseTop2MLP(
+            model_config,
+        )
+
+    def make_and_load_expert_wrapper(
+        config: MixtralConfig,
+        states_dir: str,
+        expert_uid: tuple[int, int],
+        device: torch.device,
+    ) -> MixtralExpertWrapper:
+        layer_idx, expert_idx = expert_uid
+
+        index_path = os.path.join(states_dir, "model.safetensors.index.json")
+        with open(index_path) as f:
+            module_idx = f"model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}"
+            weight_map = json.load(f)["weight_map"]
+            state_fpaths = [weight_map[f"{module_idx}.w{i}.weight"] for i in [1,2,3]]
+            state_fpaths = set(state_fpaths)
+
+        for state_fpath in state_fpaths:
+            state_dict = load_file(os.path.join(states_dir, state_fpath), device=str(device))
+            expert = make_empty_expert(config).bfloat16()
+            for idx in range(1, 4):
+                layer = getattr(expert, f"w{idx}")
+                key = f'model.layers.{layer_idx}.block_sparse_moe.experts.{expert_idx}.w{idx}.weight'
+                if key in state_dict:
+                    w_to_load = state_dict[key]
+                    layer.weight.data.copy_(w_to_load)
+
+        return MixtralExpertWrapper(expert, device)
+    
+    def load_00_expert_state_dict(states_dir: str, device: torch.device):
+        index_path = os.path.join(states_dir, "model.safetensors.index.json")
+        with open(index_path) as f:
+            module_idx = f"model.layers.0.block_sparse_moe.experts.0"
+            state_fpath = json.load(f)["weight_map"][f"{module_idx}.w1.weight"]
+        return load_file(os.path.join(states_dir, state_fpath), device=str(device))
+
+    device = torch.device("cuda:0")
+    model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+    if config is None:
+        config = AutoConfig.from_pretrained(
+            model_name,
+            num_local_experts=8,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
+        )
+        config.offload = True
+    
+    state_path = "/home/scratch.shunkangz_gpu/Research/NUS_Project/Checkpoint/models--mistralai--Mixtral-8x7B-v0.1/snapshots/985aa055896a8f943d4a9f2572e6ea1341823841"
+    
+    num_experts = config.num_local_experts
+    offload_config = OffloadConfig(
+        main_size=config.num_hidden_layers * (num_experts - offload_per_layer),
+        offload_size=config.num_hidden_layers * offload_per_layer,
+        buffer_size=buffer_size,
+        offload_per_layer=offload_per_layer,
+    )
+
+    def _make_module():
+        config = AutoConfig.from_pretrained(model_name)
+        expert = make_empty_expert(config).bfloat16()
+        # expert.load_state_dict(state_dict_00)
+        return MixtralExpertWrapper(expert, device=device)
+
+    with device, with_default_dtype(torch.bfloat16):
+        model = MixtralForCausalLM(config)
+    
+    print("Create cache")
+    model_config = config
+    expert_cache = ExpertCacheV1(
+        make_module=_make_module,
+        main_size=offload_config.main_size,
+        offload_size=offload_config.offload_size + offload_config.main_size,
+        buffer_size=offload_config.buffer_size,
+        num_layer=config.num_hidden_layers,
+    )
+
+    print("Add expert in cache")
+    for layer_idx in range(model_config.num_hidden_layers):
+        curr_layer = model.model.layers[layer_idx]
+        curr_layer.block_sparse_moe = SparseMoeWrapper(
+            model_config,
+            layer_idx,
+            curr_layer.block_sparse_moe.gate,
+            expert_cache,
+        )
+
+        for expert_idx in range(model_config.num_local_experts):
+            do_offload = expert_idx < offload_config.offload_per_layer
+
+            expert_wrapper = make_and_load_expert_wrapper(
+                config=model_config,
+                states_dir=state_path,
+                expert_uid=(layer_idx, expert_idx),
+                device=device,
+            )
+
+            expert_cache.add_expert(
+                uid=(layer_idx, expert_idx),
+                module=expert_wrapper,
+                eviction_group=layer_idx,
+                offload=do_offload,
+            )
+
+            del expert_wrapper
+            torch.cuda.synchronize(device)
+            torch.cuda.empty_cache()
+    return model
 
 if __name__ == '__main__':
     import os
@@ -1972,14 +2180,15 @@ if __name__ == '__main__':
     init_env()
     rank = dist.get_rank()
     device = f"cuda:{rank}" if torch.cuda.is_available() else 'cpu'
-    model = build_offload_model()
-    model = model.bfloat16()
-    model = model.to(device)
-    print(model)
-    x = torch.randint(0,100,(2,10)).to(device)
-    attention_mask = torch.ones(2,10).to(device)
-    out = model(x)
-    print(out.logits.shape)
+    # model = build_offload_model()
+    # model = model.bfloat16()
+    # model = model.to(device)
+    # print(model)
+    # x = torch.randint(0,100,(2,10)).to(device)
+    # attention_mask = torch.ones(2,10).to(device)
+    # out = model(x)
+    # print(out.logits.shape)
+    model = build_offload_model_v1()
 
     # tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
     # tokenizer.padding_side = 'left'

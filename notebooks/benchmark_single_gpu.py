@@ -25,7 +25,7 @@ def prepare_data(dataset_list: Dict[str,int]):
     data = []
     # alpaca_data
     if 'alpaca' in dataset_list:
-        alpaca_data = load_json("/home/nus-hx/code/Sequence-Scheduling/data/alpaca-train-10k.json")
+        alpaca_data = load_json("/home/scratch.shunkangz_gpu/Research/NUS_Project/Sequence-Scheduling/data/alpaca-train-10k.json")
         num_samples = dataset_list['alpaca']
         for i in range(num_samples):
             data.append(alpaca_data[i]['conversations'][0]['value'])
@@ -72,7 +72,7 @@ def prepare_model(
 ):
     print(f'Building and Loading a MoE model...')
     quantized_model_name = "lavawolfiee/Mixtral-8x7B-Instruct-v0.1-offloading-demo"
-    state_path = "/home/nus-hx/code/offloadMoE/data"
+    state_path = "/home/scratch.shunkangz_gpu/Research/NUS_Project/Checkpoint/models--mistralai--Mixtral-8x7B-v0.1/snapshots/985aa055896a8f943d4a9f2572e6ea1341823841"
 
     config = AutoConfig.from_pretrained(quantized_model_name)
     ##### Change this to 5 if you have only 12 GB of GPU VRAM #####
