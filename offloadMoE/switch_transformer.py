@@ -2283,7 +2283,7 @@ def build_offload_model_v1(
 ):
     
     from offloadMoE.expert_cache import ExpertCacheV1
-    from offloadMoE.custom_layers import SparseMoeWrapper
+    # from offloadMoE.custom_layers import SparseMoeWrapperV1
     from offloadMoE.utils import nested_flatten, nested_pack, with_default_dtype
     from dataclasses import dataclass
     from transformers import AutoConfig
@@ -2323,7 +2323,7 @@ def build_offload_model_v1(
     }
     MODEL_STATE_DICT = None
 
-    class SwitchMoeWrapper(nn.Module):
+    class SwitchMoeWrapperV1(nn.Module):
         def __init__(self, config, layer_id, gate, expert_cache):
             config.num_experts_per_tok = config.num_selected_experts
             config.intermediate_size = config.d_ff
@@ -2342,6 +2342,8 @@ def build_offload_model_v1(
             expert_index = torch.argmax(router_mask, dim=-1) # shape is (batch, seq_len), dtype is int64
             active_experts = expert_index.flatten().unique().tolist()
             next_states = torch.zeros_like(hidden_states)
+
+            self.experts.sync_layer(self.layer_id)
             for (_layer_index, expert_idx), expert_layer in self.experts.load_experts(
                 *((self.layer_id, expert_idx) for expert_idx in active_experts), unordered=True):
                 token_indices = router_mask[:, :, expert_idx].bool()
@@ -2553,7 +2555,7 @@ def build_offload_model_v1(
             base_layer_idx = model_config.num_layers
         for block_idx in list(range(num_block_layers))[1:][::sparse_step]:
             curr_layer = getattr(model, block_type).block[block_idx].layer[block_inner_layer_id]
-            curr_layer.mlp = SwitchMoeWrapper(
+            curr_layer.mlp = SwitchMoeWrapperV1(
                 config=model_config,
                 layer_id=block_idx+base_layer_idx,
                 gate=curr_layer.mlp.router,
@@ -2704,6 +2706,8 @@ if __name__ == '__main__':
         torch.cuda.synchronize()
 
         cache_engine.check_main_module(temp_pattern)
+
+        offload_model(input_ids)
         exit(0)
     # Load all experts based on pattern
 

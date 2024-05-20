@@ -57,6 +57,12 @@ class EvictionGroupInfo:
         for uid, info in self.main_infos.items():
             experts.append(info)
         return experts
+    
+    def uid_in_gpu(self):
+        uid_list = []
+        for uid, info in self.main_infos.items():
+            uid_list.append(uid)
+        return uid_list
 
 
 class ExpertCache:
@@ -372,6 +378,60 @@ class ExpertCacheV1(object):
         
         try:
             self.active = True
+            
+            # Save pre-loaded experts before swap
+            pre_loaded_infos = deque([info for info in infos if not info.offloaded])
+            pre_loaded_experts = deque([self.main_modules[info.index] for info in pre_loaded_infos])
+
+            infos_to_load = deque([info for info in infos if info.offloaded])
+            event_to_sync = dict()
+            for info in infos_to_load:
+                event_to_sync[info.uid] = torch.cuda.Event()
+
+            # Check current available position
+            pre_loaded_uid = set([info.uid for info in pre_loaded_infos])
+            exist_info = eviction_group.expert_in_gpu()
+
+            evict_experts_info = deque()
+            for expert_info in exist_info:
+                if expert_info.uid not in pre_loaded_uid:
+                    evict_experts_info.append(expert_info)
+            
+            # If there are still available space, we should launch
+            # prefetch here before the computation 
+            idx = 0
+            while len(evict_experts_info) > 0:
+                with torch.cuda.stream(self.ondemand_stream):
+                    if idx >= len(infos_to_load):
+                        break
+                    self._swap(infos_to_load[idx], evict_experts_info.popleft())
+                    event_to_sync[infos_to_load[idx].uid].record()
+                    idx += 1
+
+            # Record the finished computation expert
+            finish_experts_info = deque()
+            for info in infos:
+                if len(pre_loaded_infos) > 0 and info is pre_loaded_infos[0]:
+                    pre_loaded_infos.popleft()
+                    yield (info.uid, pre_loaded_experts.popleft())
+                elif len(infos_to_load) > 0:
+                    # Syn the copy and return expert
+                    event_to_sync[info.uid].synchronize()
+                    expert = self.main_modules[info.index]
+
+                    infos_to_load.popleft()
+                    idx -= 1
+                    yield (info.uid, expert)
+                
+                # Swap out the finished expert
+                finish_experts_info.append(info)
+
+                # Launch the request for next copy
+                if idx < len(infos_to_load):
+                    with torch.cuda.stream(self.ondemand_stream):
+                        self._swap(infos_to_load[idx], finish_experts_info[0])
+                        event_to_sync[infos_to_load[idx].uid].record()
+                    finish_experts_info.popleft()
         finally:
             self.active = False
     
@@ -414,6 +474,9 @@ class ExpertCacheV1(object):
             with torch.cuda.stream(self.prefetch_stream):
                 self.event_queue[layer_id] = torch.cuda.Event()
                 self.event_queue[layer_id].record()
+    
+    def sync_layer(self, layer_id):
+        self.event_queue[layer_id].synchronize()
     
     def check_main_module(self, pattern):
         for i in range(1, self.num_layer, 2):
