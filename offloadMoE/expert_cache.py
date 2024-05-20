@@ -423,8 +423,11 @@ class ExpertCacheV1(object):
                     idx -= 1
                     yield (info.uid, expert)
                 
-                # Swap out the finished expert
+                # Swap out the finished expert 
+                # TODO: Ensure the computation finished by using cuda event
                 finish_experts_info.append(info)
+                curr_stream = torch.cuda.current_stream()
+                curr_stream.synchronize()
 
                 # Launch the request for next copy
                 if idx < len(infos_to_load):
