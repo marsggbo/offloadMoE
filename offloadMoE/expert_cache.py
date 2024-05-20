@@ -37,6 +37,12 @@ class EvictionGroupInfo:
         raise ValueError("No evictable experts")
 
     def swap(self, info_to_load: ExpertInfo, info_to_evict: ExpertInfo):
+        # print("Info to load id", info_to_load.uid)
+        # print("Info to evict id", info_to_evict.uid)
+        # print("*************")
+        # print(self.offloaded_infos)
+        # print("*************")
+        # print(self.main_infos)
         assert info_to_load.uid in self.offloaded_infos and info_to_evict.uid in self.main_infos
         self.main_infos[info_to_load.uid] = self.offloaded_infos.pop(info_to_load.uid)
         self.main_infos.move_to_end(info_to_load.uid, last=True)
@@ -116,7 +122,7 @@ class ExpertCache:
             for i in range(len(self.main_modules)):
                 if self.main_infos[i] is None:
                     self.main_modules[i].storage.copy_(storage)
-                    info = ExpertInfo(uid, eviction_group=eviction_group, offloaded=False, index=i)
+                    info = ExpertInfo(uid, eviction_group=eviction_group, offloaded=False, cpu_index=i, gpu_index=-1)
                     self.registered_experts[uid] = self.main_infos[i] = info
                     self.group_infos[eviction_group].add(info)
                     return  # done allocating; found spot on device
@@ -124,7 +130,7 @@ class ExpertCache:
             for i in range(len(self.offloaded_storages)):
                 if self.offloaded_infos[i] is None:
                     self.offloaded_storages[i].copy_(storage)
-                    info = ExpertInfo(uid, eviction_group=eviction_group, offloaded=True, index=i)
+                    info = ExpertInfo(uid, eviction_group=eviction_group, offloaded=True, cpu_index=i, gpu_index=-1)
                     self.registered_experts[uid] = self.offloaded_infos[i] = info
                     self.group_infos[eviction_group].add(info)
                     return  # done allocating; found an offloaded spot
@@ -159,7 +165,7 @@ class ExpertCache:
             self.active = True
             # save pre-loaded experts before they can be swapped
             pre_loaded_infos = deque([info for info in infos if not info.offloaded])
-            pre_loaded_experts = deque([self.main_modules[info.index] for info in pre_loaded_infos])
+            pre_loaded_experts = deque([self.main_modules[info.cpu_index] for info in pre_loaded_infos])
 
             # begin loading experts into free buffers in background (via non-blocking copy)
             infos_to_load = deque([info for info in infos if info.offloaded])
@@ -198,18 +204,18 @@ class ExpertCache:
         # swap a single on-device expert with a single offloaded expert using buffers for parallelism
         offloaded_storage_buffer = self.offloaded_storage_buffers.popleft()
         device_expert_buffer = self.device_expert_buffers.popleft()
-        device_expert_buffer.storage.copy_(self.offloaded_storages[info_to_load.index], non_blocking=True)
-        offloaded_storage_buffer.copy_(self.main_modules[info_to_evict.index].storage, non_blocking=True)
+        device_expert_buffer.storage.copy_(self.offloaded_storages[info_to_load.cpu_index], non_blocking=True)
+        offloaded_storage_buffer.copy_(self.main_modules[info_to_evict.cpu_index].storage, non_blocking=True)
 
-        self.device_expert_buffers.append(self.main_modules[info_to_evict.index])
-        self.main_modules[info_to_evict.index] = device_expert_buffer
-        self.offloaded_storage_buffers.append(self.offloaded_storages[info_to_load.index])
-        self.offloaded_storages[info_to_load.index] = offloaded_storage_buffer
+        self.device_expert_buffers.append(self.main_modules[info_to_evict.cpu_index])
+        self.main_modules[info_to_evict.cpu_index] = device_expert_buffer
+        self.offloaded_storage_buffers.append(self.offloaded_storages[info_to_load.cpu_index])
+        self.offloaded_storages[info_to_load.cpu_index] = offloaded_storage_buffer
 
-        self.main_infos[info_to_evict.index] = info_to_load
-        self.offloaded_infos[info_to_load.index] = info_to_evict
+        self.main_infos[info_to_evict.cpu_index] = info_to_load
+        self.offloaded_infos[info_to_load.cpu_index] = info_to_evict
         info_to_evict.offloaded, info_to_load.offloaded = info_to_load.offloaded, info_to_evict.offloaded
-        info_to_evict.index, info_to_load.index = info_to_load.index, info_to_evict.index
+        info_to_evict.cpu_index, info_to_load.cpu_index = info_to_load.cpu_index, info_to_evict.cpu_index
         self.group_infos[info_to_load.eviction_group].swap(info_to_load, info_to_evict)
         return device_expert_buffer
 
@@ -294,7 +300,7 @@ class ExpertCacheV1(object):
         print("Group info ", self.group_infos)
 
         self.prefetch_stream = torch.cuda.Stream()
-        self.ondemand_stream = torch.cuda.Stream()
+        self.ondemand_stream = torch.cuda.Stream(priority=-1)
 
         self.num_layer = num_layer
         print("Number layer ", num_layer)
@@ -381,9 +387,11 @@ class ExpertCacheV1(object):
             
             # Save pre-loaded experts before swap
             pre_loaded_infos = deque([info for info in infos if not info.offloaded])
-            pre_loaded_experts = deque([self.main_modules[info.index] for info in pre_loaded_infos])
+            pre_loaded_experts = deque([self.main_modules[info.gpu_index] for info in pre_loaded_infos])
 
             infos_to_load = deque([info for info in infos if info.offloaded])
+
+            # print(f" {len(infos_to_load)} experts should be loaded")
             event_to_sync = dict()
             for info in infos_to_load:
                 event_to_sync[info.uid] = torch.cuda.Event()
@@ -397,6 +405,10 @@ class ExpertCacheV1(object):
                 if expert_info.uid not in pre_loaded_uid:
                     evict_experts_info.append(expert_info)
             
+            # print("========== Evict expert ==========")
+            # print(evict_experts_info)
+            # print("========== Evict Load ==========")
+            # print(infos_to_load)
             # If there are still available space, we should launch
             # prefetch here before the computation 
             idx = 0
@@ -417,7 +429,7 @@ class ExpertCacheV1(object):
                 elif len(infos_to_load) > 0:
                     # Syn the copy and return expert
                     event_to_sync[info.uid].synchronize()
-                    expert = self.main_modules[info.index]
+                    expert = self.main_modules[info.gpu_index]
 
                     infos_to_load.popleft()
                     idx -= 1
@@ -435,23 +447,36 @@ class ExpertCacheV1(object):
                         self._swap(infos_to_load[idx], finish_experts_info[0])
                         event_to_sync[infos_to_load[idx].uid].record()
                     finish_experts_info.popleft()
+                    idx += 1
         finally:
             self.active = False
     
     def prefetch(self, pattern: torch.Tensor):
         num_layers, num_experts = pattern.shape
 
+        experts = torch.nonzero(pattern, as_tuple=False).cpu().numpy().tolist()
+        required_experts = set()
+        for expert in experts:
+            required_experts.add(tuple(expert))
+
         # Only work for switch transformer
         for layer_id in range(1, num_layers, 2):
             cpu2gpu_infos = []
             eviction_group = None
 
+            # required_experts = torch.nonzero(pattern[layer_id, :], as_tuple=False).flatten().tolist()
+            # required_experts = set(required_experts)
+            
             for expert_id in range(num_experts):
                 uid: ExpertUID = (layer_id, expert_id)
                 info = self.registered_experts.get(uid)
 
                 assert info is not None, f"Unregonized Expert {uid}!"
-                required_on_gpu = pattern[layer_id, expert_id] == 1
+                # required_on_gpu = pattern[layer_id, expert_id] == 1
+                required_on_gpu = False
+                if uid in required_experts:
+                    required_on_gpu = True
+                
 
                 if required_on_gpu and info.offloaded:
                     cpu2gpu_infos.append(info)
@@ -463,8 +488,7 @@ class ExpertCacheV1(object):
             expert_in_gpu = eviction_group.expert_in_gpu()
             evict_experts = []
             for expert_info in expert_in_gpu:
-                layer_id, expert_id = expert_info.uid
-                if pattern[layer_id, expert_id] == 0:
+                if expert_info.uid not in required_experts:
                     evict_experts.append(expert_info)
 
             while cpu2gpu_infos and evict_experts:

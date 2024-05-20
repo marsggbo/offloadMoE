@@ -1963,10 +1963,10 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
 
 
 def build_offload_model(
-    offload_per_layer: int=12,
+    offload_per_layer: int=16,
     buffer_size:int = 6,
     state_path: str='/home/nus-hx/.cache/huggingface/hub/models--google--switch-base-16/snapshots/0ef7d88ed50ec5f2cfdc019e81cef04d19700f8f',
-    model_name="google/switch-base-16",
+    model_name="google/switch-base-32",
     device = torch.device("cuda:0"),
     config=None
 ):
@@ -1986,6 +1986,10 @@ def build_offload_model(
             'index_file': None
         },
         'google/switch-base-16': {
+            'file_type': 'bin',
+            'index_file': None
+        },
+        'google/switch-base-32': {
             'file_type': 'bin',
             'index_file': None
         },
@@ -2115,6 +2119,15 @@ def build_offload_model(
                 setattr(layer, layer_id, patched)
 
             return layer, storage
+
+    def forward_pre_hook(module, input):
+        if isinstance(module, SwitchMoeWrapper):
+            torch.cuda.nvtx.range_push(f"Layer ID {module.layer_id} {module.__class__.__name__}")
+        else:
+            torch.cuda.nvtx.range_push(f"Layer ID {module.__class__.__name__}")
+
+    def forward_post_hook(module, input, output):
+        torch.cuda.nvtx.range_pop()
 
     @dataclass(frozen=True)
     class OffloadConfig:
@@ -2271,6 +2284,13 @@ def build_offload_model(
             if 'expert' not in key:
                 non_expert_dict[key] = val
         model.load_state_dict(non_expert_dict, True)
+
+    for module in model.modules():
+        if isinstance(module, SwitchMoeWrapper) or isinstance(module, SwitchTransformersAttention) or \
+        isinstance(module, SwitchTransformersLayerFF) or isinstance(module, SwitchTransformersSparseMLP):
+            module.register_forward_pre_hook(forward_pre_hook)
+            module.register_forward_hook(forward_post_hook)
+
     return model
 
 def build_offload_model_v1(
@@ -2342,6 +2362,9 @@ def build_offload_model_v1(
             expert_index = torch.argmax(router_mask, dim=-1) # shape is (batch, seq_len), dtype is int64
             active_experts = expert_index.flatten().unique().tolist()
             next_states = torch.zeros_like(hidden_states)
+
+            # print(f"{len(active_experts)} should be loaded")
+            # print("Hidden shape ", hidden_states.shape)
 
             self.experts.sync_layer(self.layer_id)
             for (_layer_index, expert_idx), expert_layer in self.experts.load_experts(
@@ -2432,6 +2455,15 @@ def build_offload_model_v1(
                 setattr(layer, layer_id, patched)
 
             return layer, storage
+        
+    def forward_pre_hook(module, input):
+        if isinstance(module, SwitchMoeWrapperV1):
+            torch.cuda.nvtx.range_push(f"Layer ID {module.layer_id} {module.__class__.__name__}")
+        else:
+            torch.cuda.nvtx.range_push(f"Layer ID {module.__class__.__name__}")
+
+    def forward_post_hook(module, input, output):
+        torch.cuda.nvtx.range_pop()
 
     @dataclass(frozen=True)
     class OffloadConfig:
@@ -2592,8 +2624,138 @@ def build_offload_model_v1(
             if 'expert' not in key:
                 non_expert_dict[key] = val
         model.load_state_dict(non_expert_dict, True)
+    
+    for module in model.modules():
+        if isinstance(module, SwitchMoeWrapperV1) or isinstance(module, SwitchTransformersAttention) or \
+        isinstance(module, SwitchTransformersLayerFF) or isinstance(module, SwitchTransformersSparseMLP):
+            module.register_forward_pre_hook(forward_pre_hook)
+            module.register_forward_hook(forward_post_hook)
+
     return model, expert_cache
 
+def fix_decode_generate(input_ids,
+                            decode_ids,
+                            attention_mask,
+                            predict_pattern,
+                            model,
+                            cache_engine,
+                            max_new_tokens=128,
+                            past_key_values=None,
+                            compute_stream=None,
+                            is_offload=False,
+                            temperature=0.9,
+                            top_p=0.9):
+        # 初始化生成的令牌列表和past_key_values（用于存储注意力层的状态，加速和优化生成）
+    generated_tokens = []
+    past = past_key_values
+
+    pattern = torch.zeros((24, 32), dtype=torch.int).to(device)
+    decoder_input_ids = torch.tensor([[0]]*len(input_ids)).int().to(device)
+    encoder_outputs = None
+
+    print(f"Start inference")
+    model.eval()  # Put model in evaluation mode
+    with torch.no_grad():  # Disable gradient calculation
+        for step in range(max_new_tokens):
+            torch.cuda.nvtx.range_push(f"Step {step}")
+            if is_offload:
+                torch.cuda.nvtx.range_push(f"Prefetch")
+                cache_engine.prefetch(pattern)
+                torch.cuda.nvtx.range_pop()
+
+            with torch.cuda.stream(compute_stream):
+                outputs = model(input_ids=input_ids,
+                                decoder_input_ids=decoder_input_ids,
+                                attention_mask=attention_mask,
+                                past_key_values=past,
+                                encoder_outputs=encoder_outputs,
+                                output_router_logits=True,
+                                use_cache=True)  # use_cache允许模型返回past_key_values
+            print(f"Step{step}: encoder-{outputs.encoder_router_logits[1][0].shape} decoder-{outputs.decoder_router_logits[1][0].shape}")
+            
+            # Select the next token based on the decode_id
+            next_token = decode_ids[:, step]
+            next_token = torch.unsqueeze(next_token, dim=-1).to(torch.int)
+
+            # 应用temperature来调整预测分布
+            generated_tokens.append(next_token)
+            # decoder_input_ids = torch.cat([decoder_input_ids, next_token], dim=-1)
+            decoder_input_ids = next_token
+            
+            # Update the predict pattern
+            if is_offload:
+                pattern = predict_pattern[step]
+
+            # Update Key-Value cache
+            past = outputs.past_key_values
+
+            # Update encoder outputs
+            if encoder_outputs is None:
+                encoder_outputs = MoEModelOutput(last_hidden_state=outputs.encoder_last_hidden_state,
+                                                hidden_states=outputs.encoder_hidden_states,
+                                                attentions=outputs.encoder_attentions,
+                                                router_probs=outputs.encoder_router_logits)
+            torch.cuda.nvtx.range_pop()
+            if step == 7:
+                return
+
+def benchmark_new_offload(state_path):
+    offload_model, cache_engine = build_offload_model_v1(offload_per_layer=24, state_path=state_path)
+    offload_model = offload_model.bfloat16().to(device)
+
+    dataset = load_dataset("marsggbo/bigbench4switch32_pattern_predictor_tmp")
+    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-32")
+    tokenizer.padding_side = 'left'
+    batch_size = 16
+    compute_stream = torch.cuda.Stream()
+
+    torch.cuda.cudart().cudaProfilerStart()
+    for input_data, decode_id, pattern in process_dataset(dataset, tokenizer, batch_size):
+        input_ids = input_data.input_ids.to(device)
+        attention_mask = input_data.attention_mask.to(device)
+        decode_input_id = decode_id.to(device)
+        predict_pattern = pattern.to(device)
+
+        print("predict pattern shape ", predict_pattern.shape)
+
+        fix_decode_generate(input_ids, decode_input_id, attention_mask, predict_pattern, offload_model, cache_engine, is_offload=True, compute_stream=compute_stream)
+        # temp_pattern = predict_pattern[0]
+
+        # cache_engine.prefetch(temp_pattern)
+        # torch.cuda.synchronize()
+
+        # cache_engine.check_main_module(temp_pattern)
+        torch.cuda.nvtx.range_pop()
+        exit(0)
+
+def benchmark_origin_offload(state_path):
+    offload_model = build_offload_model(offload_per_layer=24, state_path=state_path)
+    offload_model = offload_model.bfloat16().to(device)
+
+    dataset = load_dataset("marsggbo/bigbench4switch32_pattern_predictor_tmp")
+    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-32")
+    tokenizer.padding_side = 'left'
+    batch_size = 16
+    compute_stream = torch.cuda.Stream()
+
+    torch.cuda.cudart().cudaProfilerStart()
+    for input_data, decode_id, pattern in process_dataset(dataset, tokenizer, batch_size):
+        input_ids = input_data.input_ids.to(device)
+        attention_mask = input_data.attention_mask.to(device)
+        decode_input_id = decode_id.to(device)
+        predict_pattern = pattern.to(device)
+
+        print("predict pattern shape ", predict_pattern.shape)
+
+        fix_decode_generate(input_ids, decode_input_id, attention_mask, None, offload_model, None, is_offload=False, compute_stream=compute_stream)
+        # temp_pattern = predict_pattern[0]
+
+        # cache_engine.prefetch(temp_pattern)
+        # torch.cuda.synchronize()
+
+        # cache_engine.check_main_module(temp_pattern)
+        torch.cuda.nvtx.range_pop()
+        exit(0)
 
 if __name__ == '__main__':
     import os
@@ -2685,30 +2847,8 @@ if __name__ == '__main__':
     # decoder_input_ids=torch.tensor([[0]]*len(x)).int().to(device)
 
     state_path = "/home/scratch.shunkangz_gpu/Research/NUS_Project/Checkpoint/models--google--switch-base-32/snapshots/2018338b8dad760fa7a35a754d532486ef3942f9"
-    offload_model, cache_engine = build_offload_model_v1(offload_per_layer=16, state_path=state_path)
-
-    dataset = load_dataset("marsggbo/bigbench4switch32_pattern_predictor")
-    tokenizer = AutoTokenizer.from_pretrained("google/switch-base-32")
-    tokenizer.padding_side = 'left'
-    batch_size = 8
-
-    for input_data, decode_id, pattern in process_dataset(dataset, tokenizer, batch_size):
-        input_ids = input_data.input_ids.to(device)
-        attention_mask = input_data.attention_mask.to(device)
-        decode_input_id = decode_id.to(device)
-        predict_pattern = pattern.to(device)
-
-        print("predict pattern shape ", predict_pattern.shape)
-
-        temp_pattern = predict_pattern[0]
-
-        cache_engine.prefetch(temp_pattern)
-        torch.cuda.synchronize()
-
-        cache_engine.check_main_module(temp_pattern)
-
-        offload_model(input_ids)
-        exit(0)
+    benchmark_origin_offload(state_path)
+    # benchmark_new_offload(state_path)
     # Load all experts based on pattern
 
     ############################################
