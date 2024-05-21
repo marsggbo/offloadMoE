@@ -611,6 +611,9 @@ class SwitchTransformersAttention(nn.Module):
         attn_weights = nn.functional.softmax(scores.float(), dim=-1).type_as(
             scores
         )  # (batch_size, n_heads, seq_length, key_length)
+        # attn_weights = nn.functional.softmax(scores, dim=-1).type_as(
+        #     scores
+        # 
         attn_weights = nn.functional.dropout(
             attn_weights, p=self.dropout, training=self.training
         )  # (batch_size, n_heads, seq_length, key_length)
@@ -2696,8 +2699,6 @@ def fix_decode_generate(input_ids,
                                                 attentions=outputs.encoder_attentions,
                                                 router_probs=outputs.encoder_router_logits)
             torch.cuda.nvtx.range_pop()
-            if step == 7:
-                return
 
 def benchmark_new_offload(state_path):
     offload_model, cache_engine = build_offload_model_v1(offload_per_layer=24, state_path=state_path)
@@ -2710,7 +2711,13 @@ def benchmark_new_offload(state_path):
     compute_stream = torch.cuda.Stream()
 
     torch.cuda.cudart().cudaProfilerStart()
+    batch = 0
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
     for input_data, decode_id, pattern in process_dataset(dataset, tokenizer, batch_size):
+        torch.cuda.nvtx.range_push(f"Batch {batch}")
+        if batch == 1:
+            start_event.record()
         input_ids = input_data.input_ids.to(device)
         attention_mask = input_data.attention_mask.to(device)
         decode_input_id = decode_id.to(device)
@@ -2718,15 +2725,19 @@ def benchmark_new_offload(state_path):
 
         print("predict pattern shape ", predict_pattern.shape)
 
-        fix_decode_generate(input_ids, decode_input_id, attention_mask, predict_pattern, offload_model, cache_engine, is_offload=True, compute_stream=compute_stream)
-        # temp_pattern = predict_pattern[0]
+        fix_decode_generate(input_ids, decode_input_id, attention_mask, predict_pattern, offload_model, cache_engine, is_offload=True, compute_stream=compute_stream, max_new_tokens=7)
 
-        # cache_engine.prefetch(temp_pattern)
-        # torch.cuda.synchronize()
-
-        # cache_engine.check_main_module(temp_pattern)
+        batch += 1
         torch.cuda.nvtx.range_pop()
-        exit(0)
+
+    end_event.record()
+    torch.cuda.synchronize()
+
+    # Calculate the elapsed time in milliseconds
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    print(f"Elapsed time: {elapsed_time_ms} ms")
+    torch.cuda.cudart().cudaProfilerStop()
+    return
 
 def benchmark_origin_offload(state_path):
     offload_model = build_offload_model(offload_per_layer=24, state_path=state_path)
@@ -2739,7 +2750,13 @@ def benchmark_origin_offload(state_path):
     compute_stream = torch.cuda.Stream()
 
     torch.cuda.cudart().cudaProfilerStart()
+    batch = 0
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
     for input_data, decode_id, pattern in process_dataset(dataset, tokenizer, batch_size):
+        torch.cuda.nvtx.range_push(f"Batch {batch}")
+        if batch == 1:
+            start_event.record()
         input_ids = input_data.input_ids.to(device)
         attention_mask = input_data.attention_mask.to(device)
         decode_input_id = decode_id.to(device)
@@ -2747,15 +2764,18 @@ def benchmark_origin_offload(state_path):
 
         print("predict pattern shape ", predict_pattern.shape)
 
-        fix_decode_generate(input_ids, decode_input_id, attention_mask, None, offload_model, None, is_offload=False, compute_stream=compute_stream)
-        # temp_pattern = predict_pattern[0]
+        fix_decode_generate(input_ids, decode_input_id, attention_mask, None, offload_model, None, is_offload=False, compute_stream=compute_stream, max_new_tokens=7)
 
-        # cache_engine.prefetch(temp_pattern)
-        # torch.cuda.synchronize()
-
-        # cache_engine.check_main_module(temp_pattern)
+        batch += 1
         torch.cuda.nvtx.range_pop()
-        exit(0)
+    end_event.record()
+    torch.cuda.synchronize()
+
+    # Calculate the elapsed time in milliseconds
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    print(f"Elapsed time: {elapsed_time_ms} ms")
+    torch.cuda.cudart().cudaProfilerStop()
+    return
 
 if __name__ == '__main__':
     import os
@@ -2847,8 +2867,8 @@ if __name__ == '__main__':
     # decoder_input_ids=torch.tensor([[0]]*len(x)).int().to(device)
 
     state_path = "/home/scratch.shunkangz_gpu/Research/NUS_Project/Checkpoint/models--google--switch-base-32/snapshots/2018338b8dad760fa7a35a754d532486ef3942f9"
-    benchmark_origin_offload(state_path)
-    # benchmark_new_offload(state_path)
+    # benchmark_origin_offload(state_path)
+    benchmark_new_offload(state_path)
     # Load all experts based on pattern
 
     ############################################

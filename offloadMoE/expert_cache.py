@@ -459,46 +459,41 @@ class ExpertCacheV1(object):
         for expert in experts:
             required_experts.add(tuple(expert))
 
-        # Only work for switch transformer
-        for layer_id in range(1, num_layers, 2):
-            cpu2gpu_infos = []
-            eviction_group = None
-
-            # required_experts = torch.nonzero(pattern[layer_id, :], as_tuple=False).flatten().tolist()
-            # required_experts = set(required_experts)
-            
-            for expert_id in range(num_experts):
-                uid: ExpertUID = (layer_id, expert_id)
-                info = self.registered_experts.get(uid)
-
-                assert info is not None, f"Unregonized Expert {uid}!"
-                # required_on_gpu = pattern[layer_id, expert_id] == 1
-                required_on_gpu = False
-                if uid in required_experts:
-                    required_on_gpu = True
+        with torch.cuda.stream(self.prefetch_stream):
+            # Only work for switch transformer
+            for layer_id in range(1, num_layers, 2):
+                cpu2gpu_infos = []
+                eviction_group = None
                 
+                for expert_id in range(num_experts):
+                    uid: ExpertUID = (layer_id, expert_id)
+                    info = self.registered_experts.get(uid)
 
-                if required_on_gpu and info.offloaded:
-                    cpu2gpu_infos.append(info)
+                    assert info is not None, f"Unregonized Expert {uid}!"
+                    required_on_gpu = False
+                    if uid in required_experts:
+                        required_on_gpu = True
+
+                    if required_on_gpu and info.offloaded:
+                        cpu2gpu_infos.append(info)
+                    
+                    if eviction_group is None:
+                        eviction_group = self.group_infos[info.eviction_group]
                 
-                if eviction_group is None:
-                    eviction_group = self.group_infos[info.eviction_group]
-            
-            # Get evict expert
-            expert_in_gpu = eviction_group.expert_in_gpu()
-            evict_experts = []
-            for expert_info in expert_in_gpu:
-                if expert_info.uid not in required_experts:
-                    evict_experts.append(expert_info)
+                # Get evict expert
+                expert_in_gpu = eviction_group.expert_in_gpu()
+                evict_experts = []
+                for expert_info in expert_in_gpu:
+                    if expert_info.uid not in required_experts:
+                        evict_experts.append(expert_info)
 
-            while cpu2gpu_infos and evict_experts:
-                info_to_load = cpu2gpu_infos.pop()
-                info_to_evict = evict_experts.pop()
 
-                with torch.cuda.stream(self.prefetch_stream):
+                while cpu2gpu_infos and evict_experts:
+                    info_to_load = cpu2gpu_infos.pop()
+                    info_to_evict = evict_experts.pop()
+
                     self._swap(info_to_load, info_to_evict)
 
-            with torch.cuda.stream(self.prefetch_stream):
                 self.event_queue[layer_id] = torch.cuda.Event()
                 self.event_queue[layer_id].record()
     
