@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 import numpy as np
 from transformers import AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from transformers.modeling_outputs import MoEModelOutput
 
 from offloadMoE.switch_transformer import build_offload_model
@@ -42,29 +42,32 @@ def main(args):
     }
     print(f'Building dataset including {dataset_list}')
     data = prepare_data(dataset_list)
+    data = data*3
     ###### random order
     # indices = list(range(len(data)))
     # np.random.shuffle(indices)
     # data = np.array(data)[indices]
     ###### length-sorted order
     data = np.array(sorted(data, key=len))
-    batch_size = 16
+    batch_size = 8
     batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
 
     device = torch.device("cuda:0")
-    model_name = "google/switch-base-16"
-    state_path='~/.cache/huggingface/hub/models--google--switch-base-16/snapshots/*'
-    state_path=os.path.expanduser(state_path)
+    num_experts = 128
+    model_name = f"google/switch-base-{num_experts}"
+    state_path = f'~/.cache/huggingface/hub/models--google--switch-base-{num_experts}/snapshots/*'
+    state_path = os.path.expanduser(state_path)
     model = build_offload_model(
-        offload_per_layer=8,
-        buffer_size=8,
+        offload_per_layer=num_experts//2,
+        buffer_size=num_experts//2,
         state_path=state_path,
         model_name=model_name,
         device=device
     )
     model = model.to(device)
-    max_new_tokens = 8
+    max_new_tokens = 32
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = 'left'
 
     ###### baseline: original implementation
     if args.task == 0:
@@ -72,7 +75,7 @@ def main(args):
 
     ###### get pattern matrices of given batches of requests, including prefilling and decoding tokens
     elif args.task ==1:
-        pattern_matrices = get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device)
+        pattern_matrices = get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device, num_experts)
 
     ###### Idea: run with ground truth of pattern matrices
     elif args.task == 2:
@@ -126,28 +129,21 @@ def custom_generate(
     predictor=None
 ):
     # 初始化生成的令牌列表和past_key_values（用于存储注意力层的状态，加速和优化生成）
-    generated_tokens = []
+    generated_tokens = [decoder_input_ids]
     past = past_key_values
     model.eval()  # Put model in evaluation mode
-    with torch.no_grad():  # Disable gradient calculation
+    with torch.inference_mode():  # Disable gradient calculation
         encoder_outputs = None
+        encoder_router_indices = None
+        decoder_router_indices_list = []
         for step in range(max_new_tokens):
-            if step==0:
-                # prefilling
-                outputs = model(input_ids=input_ids,
-                                decoder_input_ids=decoder_input_ids,
-                                attention_mask=attention_mask,
-                                past_key_values=past,
-                                output_router_logits=True,
-                                use_cache=True)  # use_cache允许模型返回past_key_values
-            else:
-                # decoding
-                outputs = model(encoder_outputs=encoder_outputs,
-                                decoder_input_ids=decoder_input_ids,
-                                past_key_values=past,
-                                output_router_logits=True,
-                                use_cache=True)  # use_cache允许模型返回past_key_values
-            # print(f"Step{step}: encoder-{outputs.encoder_router_logits[1][0].shape} decoder-{outputs.decoder_router_logits[1][0].shape}")
+            outputs = model(input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            encoder_outputs=encoder_outputs,
+                            decoder_input_ids=decoder_input_ids,
+                            past_key_values=past,
+                            output_router_logits=True,
+                            use_cache=True)  # use_cache允许模型返回past_key_values
             # 获取输出中的下一个token logits和更新past_key_values
             next_token_logits = outputs.logits[:, -1, :]
             past = outputs.past_key_values
@@ -161,15 +157,26 @@ def custom_generate(
             next_token = torch.multinomial(probs, 1) # (batch_size , 1)
             # 将生成的令牌添加到列表和解码器输入中
             generated_tokens.append(next_token)
-            decoder_input_ids = torch.cat([decoder_input_ids, next_token], dim=-1)
+            decoder_input_ids = next_token
             encoder_outputs = MoEModelOutput(
                 last_hidden_state=outputs.encoder_last_hidden_state,
                 hidden_states=outputs.encoder_hidden_states,
                 attentions=outputs.encoder_attentions,
                 router_probs=outputs.encoder_router_logits,
             )
-
-        return torch.cat(generated_tokens, dim=-1), (outputs.encoder_router_logits, outputs.decoder_router_logits)
+            if encoder_router_indices is None:
+                encoder_router_logits = outputs.encoder_router_logits
+                encoder_router_indices = [x[1] if len(x)==2 else None for x in encoder_router_logits]
+            decoder_router_indices_list.append(outputs.decoder_router_logits)
+        generated_tokens = torch.cat(generated_tokens, dim=-1) # (batch_size, seq_len)
+        decoder_router_indices = []
+        num_layers = len(decoder_router_indices_list[0])
+        for i in range(num_layers):
+            crt_layer_indices = None
+            if i%2 ==1:
+                crt_layer_indices = torch.cat([x[i][1] for x in decoder_router_indices_list], dim=1) # (batch_size, seq_len)
+            decoder_router_indices.append(crt_layer_indices)
+        return generated_tokens[:,:-1], (encoder_router_indices, decoder_router_indices)
 
 def top_p_filtering(logits, top_p=0.9):
     """
@@ -196,62 +203,59 @@ def top_p_filtering(logits, top_p=0.9):
     logits[indices_to_remove] = float('-inf')
     return logits
 
-def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
+def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device, num_experts):
     # Initialize a dictionary to hold the activations
     pattern_matrices = {
         # 0: {
         #     'prompt_text': "this is a prompt",
-        #     'prompt_token_ids': ,
-        #     'token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
-        #     'prompt_attention_mask': ,
-        #     'token_pattern_matrices': # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
+        #     'prompt_ids': [], # prompt token list
+        #     'prompt_pattern': , # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
+        #     'decode_ids': [], # deocde token list
+        #     'decode_pattern': , # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
         # },
         # 1: {},
         # ...
     }
     for batch_idx, batch in enumerate(batches):
+        if batch_idx % 100==0:
+            print(f'Processing batch {batch_idx}/{len(batches)} for switch-{num_experts}')
         batch = batch.tolist()
         data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
         data = {key: val.to(device) for key, val in data.items()}
         data['decoder_input_ids'] = torch.zeros(
             (data['input_ids'].shape[0],1), dtype=torch.long, device=device)
-        generated_token_ids, router_logits = custom_generate(
+        generated_token_ids, router_indices = custom_generate(
             **data, model=model, max_new_tokens=max_new_tokens
         )
-        (encoder_router_logits, decoder_router_logits) = router_logits
-        bs, seq_len = generated_token_ids.shape
-        num_layers = len(decoder_router_logits) // 2
-        token_pattern_matrices_logits = decoder_router_logits[1::2]
-        token_pattern_matrices_logits = [x[0] for x in token_pattern_matrices_logits]
-        token_pattern_matrices_logits = torch.stack(token_pattern_matrices_logits, dim=-2) # (num_tokens, num_layers, num_experts)
-        token_pattern_matrices_logits = token_pattern_matrices_logits.view(bs, seq_len, num_layers, -1) # (bs, seq_len, num_layers, num_experts)
-        
-        ####################################################
-        # 将router logits转换成one-hot pattern matrix
-        ####################################################
-        # Step 1: 获取每行 top-2 的索引
-        topk = 1
-        _, topk_indices = torch.topk(token_pattern_matrices_logits, topk, dim=-1)
-        # Step 2: 创建一个初始全为 0 的张量
-        token_pattern_matrices = torch.zeros_like(token_pattern_matrices_logits)
-        # Step 3: 使用高级索引将 top-2 位置设置为 1
-        # 构建批量索引
-        batch_size, seq_len, num_layers, _ = token_pattern_matrices_logits.shape
-        bs_indices = torch.arange(batch_size)[:, None, None, None].expand(-1, seq_len, num_layers, topk) # (bs, seq, num_layers, topk)
-        seq_indices = torch.arange(seq_len)[None, :, None, None].expand(batch_size, -1, num_layers, topk)
-        layer_indices = torch.arange(num_layers)[None, None, :, None].expand(batch_size, seq_len, -1, topk)
-        # Step 4: 将 top-2 位置设置为 1
-        token_pattern_matrices[bs_indices, seq_indices, layer_indices, topk_indices] = 1
+        (encoder_router_indices, decoder_router_indices) = router_indices
 
         for i, text in enumerate(batch):
+            prompt_ids = data['input_ids'][i].cpu()[data['attention_mask'][i].cpu()==1]
+            decode_ids = generated_token_ids[i].detach().cpu()
+            pad_len = (data['attention_mask'][i]==0).sum().item()
             pattern_matrices[len(batch)*batch_idx+i] = {
                 'prompt_text': text,
-                'prompt_token_ids': data['input_ids'][i].cpu(),
-                'prompt_attention_mask': data['attention_mask'][i].cpu(),
-                'token_ids': generated_token_ids[i].detach().cpu()[:-1],
-                'token_pattern_matrices': token_pattern_matrices[i]
+                'prompt_ids': prompt_ids.tolist(),
+                'decode_ids': decode_ids.tolist(),
+                'prompt_pattern': [x[i, pad_len:].tolist() for x in encoder_router_indices if x is not None],
+                'decode_pattern': [x[i].tolist() for x in decoder_router_indices if x is not None]
             }
     torch.save(pattern_matrices, 'switch_pattern_matrices.pt')
+    hf_pattern_matrices = {
+        'prompt_text': [],
+        'prompt_ids': [],
+        'decode_ids': [],
+        'prompt_pattern': [],
+        'decode_pattern': []
+    }
+    for i in range(len(pattern_matrices)):
+        hf_pattern_matrices['prompt_text'].append(pattern_matrices[i]['prompt_text'])
+        hf_pattern_matrices['prompt_ids'].append(pattern_matrices[i]['prompt_ids'])
+        hf_pattern_matrices['decode_ids'].append(pattern_matrices[i]['decode_ids'])
+        hf_pattern_matrices['prompt_pattern'].append(pattern_matrices[i]['prompt_pattern'])
+        hf_pattern_matrices['decode_pattern'].append(pattern_matrices[i]['decode_pattern'])
+    hf_pattern_matrices_dataset = Dataset.from_dict(hf_pattern_matrices)
+    hf_pattern_matrices_dataset.push_to_hub(f'marsggbo/bigbench4switch{num_experts}_pattern_predictor')
     return pattern_matrices
 
 

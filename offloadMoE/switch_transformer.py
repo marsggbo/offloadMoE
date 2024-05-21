@@ -1988,6 +1988,10 @@ def build_offload_model(
             'file_type': 'bin',
             'index_file': None
         },
+        'google/switch-base-32': {
+            'file_type': 'bin',
+            'index_file': None
+        },
         'google/switch-base-64': {
             'file_type': 'bin',
             'index_file': 'pytorch_model.bin.index.json'
@@ -2167,7 +2171,8 @@ def build_offload_model(
                 state_fpaths = [weight_map[f"{module_idx}.w{i}.weight"] for i in ['i', 'o']]
                 state_fpaths = list(set(state_fpaths))
             for state_fpath in state_fpaths:
-                state_dict = weight_load_func(os.path.join(states_dir, state_fpath), device)
+                state_dict = weight_load_func(
+                    glob(os.path.join(states_dir, state_fpath))[0], device)
                 expert = make_empty_expert(config).bfloat16()
                 for idx in ['i', 'o']:
                     layer = getattr(expert, f"w{idx}")

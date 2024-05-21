@@ -142,6 +142,7 @@ def main(args):
     max_new_tokens = 8
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
 
     ###### baseline: original implementation
     if args.task == 0:
