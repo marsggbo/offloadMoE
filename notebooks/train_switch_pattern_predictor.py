@@ -23,14 +23,15 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     DataCollatorWithPadding,
     Trainer,
+    BitsAndBytesConfig,
     AdamW,
     get_linear_schedule_with_warmup
 )
 from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
-from peft import get_peft_model, LoraConfig
+from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
 
-num_decoder_sparse_layer = 6 # switch-32/64/128/256
-num_experts_per_layer = 128
+num_decoder_sparse_layer = 32 # switch-32/64/128/256
+num_experts_per_layer = 8
 NUM_LABELS = num_decoder_sparse_layer * num_experts_per_layer
 PADDING_SIDE = 'left'
 model_name_or_path = "google-t5/t5-base"
@@ -89,7 +90,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(
-        default=f"marsggbo/bigbench4switch{num_experts_per_layer}_pattern_predictor", metadata={"help": "Path to the training data."}
+        default=f"marsggbo/bigbench4switch{num_experts_per_layer}_pattern_truncation256", metadata={"help": "Path to the training data."}
     )
     eval_data_path: str = field(
         default=None, metadata={"help": "Path to the evaluation data."}
@@ -105,13 +106,22 @@ class LoraArguments:
     lora_dropout: float = 0.05
     lora_target_modules: typing.List[str] = field(
         default_factory=lambda: [
-            "q_proj",
-            "v_proj",
-            "k_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
+            # switch
+            "q",
+            "k",
+            "v",
+            "o",
+            "wi",
+            "wo"
+            
+            # # mixtral
+            # "q_proj",
+            # "v_proj",
+            # "k_proj",
+            # "o_proj",
+            # "gate_proj",
+            # "up_proj",
+            # "down_proj",
         ]
     )
     lora_weight_path: str = ""
@@ -148,7 +158,7 @@ class MoEPatternDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
-        # return 8
+        # return 128
     
     def __getitem__(self, idx):
         seq_data = self.data[idx]
@@ -157,8 +167,13 @@ class MoEPatternDataset(Dataset):
         attention_mask = torch.ones(len(input_ids)) # (encode_seq_len,)
         decoder_input_ids = torch.tensor(seq_data['decode_ids'], dtype=int)
         labels = np.stack(seq_data['decode_pattern']) # (#layers, decode_seq_len)
-        labels = torch.from_numpy(labels).permute(1, 0) # (decode_seq_len, #layers)
-        labels = torch.nn.functional.one_hot(labels, num_classes=self.num_experts_per_layer).float() # (decode_seq_len, #layers, #experts)
+        if len(labels.shape)==3:
+            labels = torch.from_numpy(labels).permute(1, 0, 2) # (decode_seq_len, #layers, topk_expert_indices)
+            labels = torch.nn.functional.one_hot(labels, num_classes=self.num_experts_per_layer).float() # (decode_seq_len, #layers, topk, #experts)
+            labels = labels.sum(-2)
+        else:
+            labels = torch.from_numpy(labels).permute(1, 0) # (decode_seq_len, #layers)
+            labels = torch.nn.functional.one_hot(labels, num_classes=self.num_experts_per_layer).float() # (decode_seq_len, #layers, #experts)
         decode_seq_len = len(decoder_input_ids)
 
         if self.training:
@@ -419,14 +434,58 @@ def compute_metrics(outputs):
     pred_labels = pred_labels.reshape(-1, num_experts_per_layer)
         
     # Convert predictions to top-2 one-hot encoding
-    preds_one_hot = np.zeros_like(pred_labels)
-    top2_indices = np.argsort(pred_labels, axis=1)[:, -1:]
+    top1_preds_one_hot = np.zeros_like(pred_labels)
+    top2_preds_one_hot = np.zeros_like(pred_labels)
+    sort_indices = np.argsort(pred_labels, axis=1)
+    top1_indices = sort_indices[:, -1:]
+    top2_indices = sort_indices[:, -2:]
     rows = np.arange(pred_labels.shape[0])[:, None]
-    preds_one_hot[rows, top2_indices] = 1
+    top1_preds_one_hot[rows, top1_indices] = 1
+    top2_preds_one_hot[rows, top2_indices] = 1
+    top1_acc = acc_precision_recall_f1(
+        true_labels, top1_preds_one_hot
+    )['accuracy']
+    top2_acc = acc_precision_recall_f1(
+        true_labels, top2_preds_one_hot
+    )['accuracy']
+    token_metrics = {
+        'top1@acc': top1_acc,
+        'top2@acc': top2_acc
+    }
 
-    return acc_precision_recall_f1(
-        true_labels, preds_one_hot
-    )
+    onehot_pred_labels = top1_preds_one_hot.reshape(bs, seq_len, num_decoder_sparse_layer * num_experts_per_layer)
+    onehot_true_labels = true_labels.reshape(bs, seq_len, num_decoder_sparse_layer * num_experts_per_layer)
+    batch_metrics = {}
+    for bs in [8, 16, 32]:
+        if bs > len(true_labels):
+            continue
+        num_batches = len(onehot_true_labels) // bs
+        batch_precision_list, batch_recall_list, batch_acc_list = [], [], []
+        for batch_idx in range(num_batches):
+            crt_batch_precision, crt_batch_recall, crt_batch_acc = [], [], []
+            for token_idx in range(seq_len):
+                x_true = onehot_true_labels[batch_idx*bs:(batch_idx+1)*bs, token_idx].sum(0)
+                x_pred = onehot_pred_labels[batch_idx*bs:(batch_idx+1)*bs, token_idx].sum(0)
+                true_indices = set(x_true.nonzero()[0])
+                pred_indices = set(x_pred.nonzero()[0])
+                TP = len(true_indices.intersection(pred_indices))
+                FP = len(pred_indices - true_indices)
+                FN = len(true_indices - pred_indices)
+                precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+                recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+                acc = TP / (TP + FP + FN) if (TP + FP + FN) > 0 else 0
+                crt_batch_precision.append(precision)
+                crt_batch_recall.append(recall)
+                crt_batch_acc.append(acc)
+            batch_precision_list.append(crt_batch_precision)
+            batch_recall_list.append(crt_batch_recall)
+            batch_acc_list.append(crt_batch_acc)
+        batch_metrics[f'bs{bs}_precision'] = np.mean(batch_precision_list)
+        batch_metrics[f'bs{bs}_recall'] = np.mean(batch_recall_list)
+        batch_metrics[f'bs{bs}_accuracy'] = np.mean(batch_acc_list)
+    batch_metrics.update(token_metrics)
+    return batch_metrics
+    
 
 def train():
     
@@ -452,10 +511,28 @@ def train():
     ################################
     # 实例化 tokenizer 和 model
     ################################
-    tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-base")
-    model = AutoModelForSeq2SeqLM.from_pretrained("google-t5/t5-base")
+    quantization_config = None
+    if lora_args.use_lora:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        model_args.model_name_or_path,
+        quantization_config=quantization_config,
+        device_map={"": 0},
+        # torch_dtype=torch.bfloat16,
+    )
     model.forward = types.MethodType(new_forward, model)
     model.lm_head = nn.Linear(model.config.hidden_size, NUM_LABELS, bias=False)
+    if lora_args.use_lora:
+        training_args.optim = "paged_adamw_8bit"
+        training_args.fp16 = True
+        model.gradient_checkpointing_enable()
+        model = prepare_model_for_kbit_training(model)
     
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -477,12 +554,12 @@ def train():
             lora_dropout=lora_args.lora_dropout,
             bias=lora_args.lora_bias,
             inference_mode=lora_args.inference_mode,
-            task_type="CAUSAL_LM",
+            task_type="SEQ_CLS",
         )
         model = get_peft_model(model, lora_config)
-        model.model.model.norm.weight.requires_grad = True
-        for module in model.lm_head:
-            module.weight.requires_grad = True
+        for name, param in model.named_parameters():
+            if 'lm_head' in name:
+                param.requires_grad = False
         if training_args.local_rank == 0:
             model.print_trainable_parameters()
 
@@ -535,6 +612,7 @@ def train():
     )
     print("#params:", sum([p.numel() for p in model.parameters()]))
     print("trainable #params:", sum([p.numel() for p in model.parameters() if p.requires_grad]))
+    model = model.cuda()
 
     trainer = Trainer(
         model=model,

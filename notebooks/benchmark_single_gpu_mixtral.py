@@ -7,7 +7,7 @@ import json
 from types import SimpleNamespace
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from transformers import TextStreamer
 
 from hqq.core.quantize import BaseQuantizeConfig
@@ -113,11 +113,11 @@ def prepare_model(
 
 
 def main(args):
-    if os.environ.get('ipdb', False):
+    if args.ipdb:
         from ipdb import set_trace
         set_trace()
     dataset_list = {
-        'alpaca': 256,
+        'alpaca': 5000,
         # 'sst2': 1000,
         # 'mrpc': 1000,
         # 'tick666-math': 1000,
@@ -139,7 +139,7 @@ def main(args):
     # model = build_offload_model(offload_per_layer=4, buffer_size=4)
     model = model.to(device)
     model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-    max_new_tokens = 8
+    max_new_tokens = 32
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
@@ -190,10 +190,10 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
     pattern_matrices = {
         # 0: {
         #     'prompt_text': "this is a prompt",
-        #     'prompt_token_ids': ,
-        #     'token_ids': [0, 2, 3, 56, 956, ...], # 大于等于 prompt
-        #     'prompt_attention_mask': ,
-        #     'token_pattern_matrices': # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
+        #     'prompt_ids': [], # prompt token list
+        #     'prompt_pattern': , # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
+        #     'decode_ids': [], # deocde token list
+        #     'decode_pattern': , # 大小为(seq_len, num_layers, num_experts)的 one-hot 矩阵
         # },
         # 1: {},
         # ...
@@ -209,33 +209,37 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device):
         num_layers = len(router_logits)
         token_pattern_matrices_logits = torch.stack(router_logits, dim=-2) # (num_tokens, num_layers, num_experts)
         token_pattern_matrices_logits = token_pattern_matrices_logits.view(bs, seq_len-1, num_layers, -1) # (bs, seq_len, num_layers, num_experts)
-        
-        ####################################################
-        # 将router logits转换成one-hot pattern matrix
-        ####################################################
-        # Step 1: 获取每行 top-2 的索引
-        topk = 2
-        _, topk_indices = torch.topk(token_pattern_matrices_logits, topk, dim=-1)
-        # Step 2: 创建一个初始全为 0 的张量
-        token_pattern_matrices = torch.zeros_like(token_pattern_matrices_logits)
-        # Step 3: 使用高级索引将 top-2 位置设置为 1
-        # 构建批量索引
-        batch_size, seq_len, num_layers, _ = token_pattern_matrices_logits.shape
-        bs_indices = torch.arange(batch_size)[:, None, None, None].expand(-1, seq_len, num_layers, topk) # (bs, seq, num_layers, topk)
-        seq_indices = torch.arange(seq_len)[None, :, None, None].expand(batch_size, -1, num_layers, topk)
-        layer_indices = torch.arange(num_layers)[None, None, :, None].expand(batch_size, seq_len, -1, topk)
-        # Step 4: 将 top-2 位置设置为 1
-        token_pattern_matrices[bs_indices, seq_indices, layer_indices, topk_indices] = 1
+        token_router_indices = token_pattern_matrices_logits.topk(2, dim=-1)[1].cpu()
+        token_router_indices = token_router_indices.permute(0, 2, 1, 3) # (batch_size, num_layers, seq_len, top2_indices)
 
         for i, text in enumerate(batch):
+            prompt_ids = data['input_ids'][i].cpu()[data['attention_mask'][i].cpu()==1]
+            decode_ids = generated_token_ids[i].detach().cpu()[-1*max_new_tokens:]
+            pad_len = (data['attention_mask'][i]==0).sum().item()
+            decode_start_idx = data['input_ids'][i].shape[0]
             pattern_matrices[len(batch)*batch_idx+i] = {
                 'prompt_text': text,
-                'prompt_token_ids': data['input_ids'][i].cpu(),
-                'prompt_attention_mask': data['attention_mask'][i].cpu(),
-                'token_ids': generated_token_ids[i].detach().cpu()[:-1],
-                'token_pattern_matrices': token_pattern_matrices[i]
+                'prompt_ids': prompt_ids,
+                'decode_ids': decode_ids,
+                'prompt_pattern': token_router_indices[i, :, pad_len:decode_start_idx].tolist(),
+                'decode_pattern': token_router_indices[i, :, -1*max_new_tokens:].tolist()
             }
     torch.save(pattern_matrices, 'pattern_matrices.pt')
+    hf_pattern_matrices = {
+        'prompt_text': [],
+        'prompt_ids': [],
+        'decode_ids': [],
+        'prompt_pattern': [],
+        'decode_pattern': []
+    }
+    for i in range(len(pattern_matrices)):
+        hf_pattern_matrices['prompt_text'].append(pattern_matrices[i]['prompt_text'])
+        hf_pattern_matrices['prompt_ids'].append(pattern_matrices[i]['prompt_ids'])
+        hf_pattern_matrices['decode_ids'].append(pattern_matrices[i]['decode_ids'])
+        hf_pattern_matrices['prompt_pattern'].append(pattern_matrices[i]['prompt_pattern'])
+        hf_pattern_matrices['decode_pattern'].append(pattern_matrices[i]['decode_pattern'])
+    hf_pattern_matrices_dataset = Dataset.from_dict(hf_pattern_matrices)
+    hf_pattern_matrices_dataset.push_to_hub(f'marsggbo/mixtral8x7b_quant_alpaca5k_pattern')    
     return pattern_matrices
 
 
@@ -305,7 +309,7 @@ def custom_generate(
         crt_tokens = input_ids
         router_logits = []
 
-        for _ in range(max_new_tokens):
+        for _ in range(max_new_tokens+1):
             if predictor is not None:
                 prefetch_experts_by_predictor(
                     model, generated_token_ids, attention_mask, predictor
@@ -587,8 +591,11 @@ if __name__ == '__main__':
     # 2: run custom_generate with prefetched pattern matrices
     # 3: run custom_generate with pattern matrices predictor
     parser.add_argument('--pattern_matrices_path', type=str, default='pattern_matrices.pt', help='Path to pattern matrices')
+    parser.add_argument('--ipdb', action='store_true', help='Enable ipdb on error')
 
     # 解析命令行输入
     args = parser.parse_args()
     main(args)
     # test_custom_generate()
+
+# torchrun --nproc_per_node=1 --master_port=26173  benchmark_single_gpu_switch.py --task 0

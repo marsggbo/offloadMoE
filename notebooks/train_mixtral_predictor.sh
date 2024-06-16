@@ -1,6 +1,6 @@
 
-WANDB_MODE=online CUDA_VISIBLE_DEVICES=0 \
-torchrun --nproc_per_node=1 --master_port=26713 \
+WANDB_MODE=online CUDA_VISIBLE_DEVICES=6 \
+torchrun --nproc_per_node=1 --master_port=26712 \
 train_mixtral_pattern_predictor.py \
    --model_name_or_path mistralai/Mistral-7B-Instruct-v0.2 \
     --output_dir ./logs/ \

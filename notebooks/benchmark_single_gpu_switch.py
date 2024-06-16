@@ -6,7 +6,7 @@ import torch
 import json
 from types import SimpleNamespace
 import numpy as np
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 from datasets import load_dataset, Dataset
 from transformers.modeling_outputs import MoEModelOutput
 
@@ -29,7 +29,7 @@ def prepare_data(dataset_list: Dict[str,int]):
 
 
 def main(args):
-    if os.environ.get('ipdb', False):
+    if args.ipdb:
         from ipdb import set_trace
         set_trace()
     dataset_list = {
@@ -53,13 +53,13 @@ def main(args):
     batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
 
     device = torch.device("cuda:0")
-    num_experts = 128
+    num_experts = args.num_experts
     model_name = f"google/switch-base-{num_experts}"
     state_path = f'~/.cache/huggingface/hub/models--google--switch-base-{num_experts}/snapshots/*'
     state_path = os.path.expanduser(state_path)
     model = build_offload_model(
-        offload_per_layer=num_experts//2,
-        buffer_size=num_experts//2,
+        offload_per_layer=num_experts//4,
+        buffer_size=num_experts//4,
         state_path=state_path,
         model_name=model_name,
         device=device
@@ -83,8 +83,13 @@ def main(args):
         run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, device, pattern_matrices)
 
     elif args.task == 3:
-        predictor = ...
-        run_benchmark_with_predictor(model, tokenizer, batches, max_new_tokens, device, predictor)
+        NUM_LABELS = 6 * num_experts
+        pred_tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-base")
+        predictor = AutoModelForSeq2SeqLM.from_pretrained("google-t5/t5-base")
+        predictor.lm_head = torch.nn.Linear(predictor.config.hidden_size, NUM_LABELS, bias=False)
+        predictor.load_state_dict(torch.load(args.predictor_ckpt, map_location=torch.device('cpu')))
+        predictor = predictor.to(device).bfloat16().eval()
+        run_benchmark_with_predictor(model, tokenizer, batches, max_new_tokens, device, pred_tokenizer, predictor)
 
     else:
         raise NotImplementedError
@@ -220,10 +225,11 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device, num_
         if batch_idx % 100==0:
             print(f'Processing batch {batch_idx}/{len(batches)} for switch-{num_experts}')
         batch = batch.tolist()
-        data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
+        data = tokenizer(
+            batch, return_tensors="pt", return_attention_mask=True, padding=True, truncation=True, max_length=256)
         data = {key: val.to(device) for key, val in data.items()}
         data['decoder_input_ids'] = torch.zeros(
-            (data['input_ids'].shape[0],1), dtype=torch.long, device=device)
+            (data['input_ids'].shape[0], 1), dtype=torch.long, device=device)
         generated_token_ids, router_indices = custom_generate(
             **data, model=model, max_new_tokens=max_new_tokens
         )
@@ -255,7 +261,7 @@ def get_pattern_matrices(model, tokenizer, batches, max_new_tokens, device, num_
         hf_pattern_matrices['prompt_pattern'].append(pattern_matrices[i]['prompt_pattern'])
         hf_pattern_matrices['decode_pattern'].append(pattern_matrices[i]['decode_pattern'])
     hf_pattern_matrices_dataset = Dataset.from_dict(hf_pattern_matrices)
-    hf_pattern_matrices_dataset.push_to_hub(f'marsggbo/bigbench4switch{num_experts}_pattern_predictor')
+    # hf_pattern_matrices_dataset.push_to_hub(f'marsggbo/bigbench4switch{num_experts}_pattern_truncation256')
     return pattern_matrices
 
 
@@ -382,6 +388,31 @@ def run_benchmark_with_patterns(model, tokenizer, batch_size, max_new_tokens, de
     throughput = total_num_tokens / (end - start)
     print(f"Throughput: {total_num_tokens} tokens/{end-start} sec = {throughput} tokens/s")
 
+
+def run_benchmark_with_predictor(model, tokenizer, batches, max_new_tokens, device, pred_tokenizer, predictor):
+    # Initialize a dictionary to hold the activations
+    num_tokens = []
+    torch.cuda.synchronize()
+    start = time.time()
+    
+    for batch_idx, batch in enumerate(batches):
+        batch = batch.tolist()
+        data = tokenizer(batch, return_tensors="pt", return_attention_mask=True, padding=True)
+        data = {key: val.to(device) for key, val in data.items()}
+        num_tokens.append(data['input_ids'].numel())
+        batch_start = time.time()
+        generated_token_ids, router_logits = custom_generate(
+            data['input_ids'], data['attention_mask'], model, max_new_tokens=max_new_tokens, predictor=None
+        )
+        batch_end = time.time()
+        print(f"Processing batch {batch_idx} data.input_ids.shape={data['input_ids'].shape} time costs: {batch_end-batch_start:.4f}s")
+    torch.cuda.synchronize()
+    end = time.time()
+    total_num_tokens = np.sum(num_tokens)
+    throughput = total_num_tokens / (end - start)
+    print(f"Throughput: {total_num_tokens} tokens/{end-start} sec = {throughput} tokens/s")
+
+
 def init_distributed_mode(args=SimpleNamespace()):
     def find_free_port(start_port: int, end_port: int):
         """
@@ -446,6 +477,9 @@ if __name__ == '__main__':
     # 2: run custom_generate with prefetched pattern matrices
     # 3: run custom_generate with pattern matrices predictor
     parser.add_argument('--pattern_matrices_path', type=str, default='pattern_matrices.pt', help='Path to pattern matrices')
+    parser.add_argument('--predictor_ckpt', type=str, help='Path to predictor checkpoint')
+    parser.add_argument('--num_experts', type=int, help='number of experts')
+    parser.add_argument('--ipdb', action='store_true', help='Enable ipdb on error')
 
     # 解析命令行输入
     args = parser.parse_args()
