@@ -30,14 +30,14 @@ from transformers import (
 from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
 from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
 
-num_decoder_sparse_layer = 32 # switch-32/64/128/256
-num_experts_per_layer = 8
+num_decoder_sparse_layer = 6 # switch-32/64/128/256: 6; mixtral: 32
+num_experts_per_layer = 32 # mixtral: 8
 NUM_LABELS = num_decoder_sparse_layer * num_experts_per_layer
 PADDING_SIDE = 'left'
-model_name_or_path = "google-t5/t5-base"
+model_name_or_path = "google-t5/t5-small"
 
 def create_optimizer_and_scheduler(
-    model, num_training_steps, learning_rate_head=2e-4, learning_rate_base=2e-5, warmup_steps=5000):
+    model, num_training_steps, learning_rate_head=2e-4, learning_rate_base=2e-5, warmup_steps=5000, weight_decay=0.01):
     # 分离 `lm_head` 的参数和其它参数
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
@@ -53,7 +53,7 @@ def create_optimizer_and_scheduler(
         },
         {
             "params": [p for n, p in model.named_parameters() if "lm_head" in n and not any(nd in n for nd in no_decay)],
-            "weight_decay": 5e-3,
+            "weight_decay": weight_decay,
             "lr": learning_rate_head,
         },
         {
@@ -83,14 +83,14 @@ class ModelArguments:
         },
     )
     padding_side: str = field(
-        default="right", metadata={"help": "The padding side in tokenizer"}
+        default="left", metadata={"help": "The padding side in tokenizer"}
     )
 
 
 @dataclass
 class DataArguments:
     data_path: str = field(
-        default=f"marsggbo/bigbench4switch{num_experts_per_layer}_pattern_truncation256", metadata={"help": "Path to the training data."}
+        default=f"marsggbo/wmt16_switch{num_experts_per_layer}_token_patterns", metadata={"help": "Path to the training data."}
     )
     eval_data_path: str = field(
         default=None, metadata={"help": "Path to the evaluation data."}
@@ -499,6 +499,14 @@ def train():
         lora_args,
         custom_args
     ) = parser.parse_args_into_dataclasses()
+    model_name = model_args.model_name_or_path.split('/')[-1]
+    dataset_name = data_args.data_path.split('/')[-1]
+    lr_head = custom_args.lr_head
+    lr_base = custom_args.lr_base
+    wd = training_args.weight_decay
+    bs = training_args.per_device_train_batch_size
+    run_name = f"{model_name}_{dataset_name}_lrhead{lr_head}_lrbase{lr_base}_ws{wd}_bs{bs}_seed{training_args.seed}"
+    training_args.run_name = run_name
     print(f'Model args: {model_args}')
     print(f'Data args: {data_args}')
     print(f'Lora args: {lora_args}')
@@ -608,7 +616,8 @@ def train():
     optimizer, scheduler = create_optimizer_and_scheduler(
         model, training_args.num_train_epochs * len_dataloader,
         learning_rate_head=custom_args.lr_head,
-        learning_rate_base=custom_args.lr_base
+        learning_rate_base=custom_args.lr_base,
+        weight_decay=training_args.weight_decay
     )
     print("#params:", sum([p.numel() for p in model.parameters()]))
     print("trainable #params:", sum([p.numel() for p in model.parameters() if p.requires_grad]))
