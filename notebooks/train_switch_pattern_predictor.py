@@ -1,3 +1,4 @@
+import os
 import types
 import logging
 import pathlib
@@ -90,7 +91,7 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: str = field(
-        default=f"marsggbo/wmt16_switch{num_experts_per_layer}_token_patterns", metadata={"help": "Path to the training data."}
+        default=f"marsggbo/xsum_switch{num_experts_per_layer}_token_patterns", metadata={"help": "Path to the training data."}
     )
     eval_data_path: str = field(
         default=None, metadata={"help": "Path to the evaluation data."}
@@ -136,7 +137,11 @@ class CustomArguments:
     train_max_seq_size: int = field(default=512, metadata={"help": "train truncation size"})
     lr_head: float = field(default=2e-4, metadata={"help": "learning rate for head"})
     lr_base: float = field(default=2e-5, metadata={"help": "learning rate for base"})
+    dim_ff: float = field(default=None, metadata={"help": "dimension ffn"})
+    dim_model: float = field(default=None, metadata={"help": "dimension of model"})
+    new_num_layers: float = field(default=None, metadata={"help": "number of layers"})
     ipdb: bool = field(default=False, metadata={"help": "debug with ipdb"})
+    suffix: str = field(default=None, metadata={"help": "suffix of experiment name"})
 
 
 # 定义 MoEPatternDataset 类
@@ -426,9 +431,9 @@ def compute_metrics(outputs):
     if isinstance(pred_labels, tuple):
         pred_labels = pred_labels[0]
     if len(pred_labels.shape) == 3:
-        bs, seq_len, dim = pred_labels.shape
+        origin_bs, seq_len, dim = pred_labels.shape
     elif len(pred_labels.shape)==4:
-        bs, seq_len, num_layer, num_experts = pred_labels.shape
+        origin_bs, seq_len, num_layer, num_experts = pred_labels.shape
         dim = num_layer * num_experts
     true_labels = true_labels.reshape(-1, num_experts_per_layer)
     pred_labels = pred_labels.reshape(-1, num_experts_per_layer)
@@ -453,37 +458,30 @@ def compute_metrics(outputs):
         'top2@acc': top2_acc
     }
 
-    onehot_pred_labels = top1_preds_one_hot.reshape(bs, seq_len, num_decoder_sparse_layer * num_experts_per_layer)
-    onehot_true_labels = true_labels.reshape(bs, seq_len, num_decoder_sparse_layer * num_experts_per_layer)
+    onehot_true_labels = true_labels.reshape(origin_bs, seq_len, num_decoder_sparse_layer, num_experts_per_layer)
     batch_metrics = {}
-    for bs in [8, 16, 32]:
-        if bs > len(true_labels):
-            continue
-        num_batches = len(onehot_true_labels) // bs
-        batch_precision_list, batch_recall_list, batch_acc_list = [], [], []
-        for batch_idx in range(num_batches):
-            crt_batch_precision, crt_batch_recall, crt_batch_acc = [], [], []
-            for token_idx in range(seq_len):
-                x_true = onehot_true_labels[batch_idx*bs:(batch_idx+1)*bs, token_idx].sum(0)
-                x_pred = onehot_pred_labels[batch_idx*bs:(batch_idx+1)*bs, token_idx].sum(0)
-                true_indices = set(x_true.nonzero()[0])
-                pred_indices = set(x_pred.nonzero()[0])
-                TP = len(true_indices.intersection(pred_indices))
-                FP = len(pred_indices - true_indices)
-                FN = len(true_indices - pred_indices)
-                precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-                recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-                acc = TP / (TP + FP + FN) if (TP + FP + FN) > 0 else 0
-                crt_batch_precision.append(precision)
-                crt_batch_recall.append(recall)
-                crt_batch_acc.append(acc)
-            batch_precision_list.append(crt_batch_precision)
-            batch_recall_list.append(crt_batch_recall)
-            batch_acc_list.append(crt_batch_acc)
-        batch_metrics[f'bs{bs}_precision'] = np.mean(batch_precision_list)
-        batch_metrics[f'bs{bs}_recall'] = np.mean(batch_recall_list)
-        batch_metrics[f'bs{bs}_accuracy'] = np.mean(batch_acc_list)
-    batch_metrics.update(token_metrics)
+    for topk, onehot_pred_labels in enumerate([top1_preds_one_hot, top2_preds_one_hot]):
+        batch_metrics[f'top{topk+1}'] = {}
+        onehot_pred_labels = onehot_pred_labels.reshape(origin_bs, seq_len, num_decoder_sparse_layer, num_experts_per_layer)
+        for bs in [4, 8, 16, 32]:
+            if bs > len(true_labels):
+                continue
+            num_batches = len(onehot_true_labels) // bs
+            batch_acc_list = []
+            for batch_idx in range(num_batches):
+                crt_batch_acc = []
+                for token_idx in range(seq_len):
+                    x_true = onehot_true_labels[batch_idx*bs:(batch_idx+1)*bs, token_idx].sum(0)
+                    x_pred = onehot_pred_labels[batch_idx*bs:(batch_idx+1)*bs, token_idx].sum(0)
+                    true_positives = np.sum(np.logical_and(x_true > 0, x_pred > 0), axis=1)
+                    actual_positives = np.sum(x_true>0, axis=1)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        layer_accuracies = np.where(actual_positives > 0, true_positives / actual_positives, 1)
+                    crt_batch_acc.append(layer_accuracies.mean())
+                batch_acc_list.append(crt_batch_acc)
+            batch_metrics[f'top{topk+1}'][f'bs{bs}_acc'] = np.mean(batch_acc_list)
+        batch_metrics.update(token_metrics)
+    print(batch_metrics)
     return batch_metrics
     
 
@@ -506,7 +504,22 @@ def train():
     wd = training_args.weight_decay
     bs = training_args.per_device_train_batch_size
     run_name = f"{model_name}_{dataset_name}_lrhead{lr_head}_lrbase{lr_base}_ws{wd}_bs{bs}_seed{training_args.seed}"
+    if custom_args.dim_ff:
+        dim_ff = int(custom_args.dim_ff)
+        dim_model = int(custom_args.dim_model)
+        run_name += f'_dff{dim_ff}_dmodel{dim_model}'
+    elif custom_args.new_num_layers:
+        new_num_layers = int(custom_args.new_num_layers)
+        run_name += f'_{new_num_layers}layers'
+    if custom_args.suffix:
+        run_name += f"_{custom_args.suffix}"
     training_args.run_name = run_name
+    output_dir = training_args.output_dir
+    if training_args.run_name:
+        output_dir += f'{training_args.run_name}'
+        training_args.output_dir = output_dir
+        if not os.path.exists(training_args.output_dir):
+            os.makedirs(training_args.output_dir)
     print(f'Model args: {model_args}')
     print(f'Data args: {data_args}')
     print(f'Lora args: {lora_args}')
@@ -528,12 +541,39 @@ def train():
             bnb_4bit_compute_dtype=torch.bfloat16
         )
 
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_args.model_name_or_path,
-        quantization_config=quantization_config,
-        device_map={"": 0},
-        # torch_dtype=torch.bfloat16,
-    )
+    if custom_args.dim_ff:
+        assert custom_args.dim_model is not None
+        # ############### width ###############
+        model_config = AutoConfig.from_pretrained(
+            model_args.model_name_or_path
+        )
+        model_config.d_ff = int(custom_args.dim_ff) # 2048 by default
+        model_config.d_model = int(custom_args.dim_model) # 512 by default
+        model = AutoModelForSeq2SeqLM.from_config(model_config)    
+    elif custom_args.new_num_layers:
+        ############### depth ###############
+        model_name = model_args.model_name_or_path
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        model_config = AutoConfig.from_pretrained(model_name)
+        model_config.num_layers = int(custom_args.new_num_layers)
+        model = AutoModelForSeq2SeqLM.from_config(model_config)
+        base_model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_args.model_name_or_path,
+            quantization_config=quantization_config,
+            device_map={"": 0},
+            torch_dtype=torch.bfloat16,
+        )
+        for i in range(3):
+            model.encoder.block[i].load_state_dict(base_model.encoder.block[i].state_dict())
+            model.decoder.block[i].load_state_dict(base_model.decoder.block[i].state_dict())
+    else:
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_args.model_name_or_path,
+            quantization_config=quantization_config,
+            device_map={"": 0},
+            torch_dtype=torch.bfloat16,
+        )
+
     model.forward = types.MethodType(new_forward, model)
     model.lm_head = nn.Linear(model.config.hidden_size, NUM_LABELS, bias=False)
     if lora_args.use_lora:
@@ -642,10 +682,6 @@ def train():
         return results
 
     print('Start training')
-    output_dir = training_args.output_dir
-    if training_args.run_name:
-        output_dir += f'{training_args.run_name}'
-        training_args.output_dir = output_dir
     # if list(pathlib.Path(output_dir).glob("checkpoint-*")):
     #     trainer.train(resume_from_checkpoint=True)
     # else:
