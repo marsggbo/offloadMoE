@@ -51,7 +51,7 @@ def main(args):
 
         print(f"No checkpoint found for {predictor_name}")
         to_load_ckpt = False
-        # exit()
+        exit()
 
     # predictor_name = "marsggbo/t5-small_dff2048_dmodel32_token-pattern-predictor_switch64_wmt16" # for test
     predictor_config = AutoConfig.from_pretrained(predictor_name)
@@ -59,6 +59,7 @@ def main(args):
     predictor.lm_head = torch.nn.Linear(predictor.config.hidden_size, NUM_LABELS, bias=False)
     if to_load_ckpt:
         predictor.load_state_dict(torch.load(ckpt_path, map_location='cpu'), strict=True)
+        print(f"Loaded predictor from {ckpt_path}")
     predictor = predictor.to(device).bfloat16().eval()
 
     new_dataset_name = dataset_name.replace('_token_patterns', '_token_real_and_predicted_patterns_t5-small_dff2048_dmodel32')
@@ -78,7 +79,7 @@ def main(args):
         encoder_outputs = None
         num_steps = decode_ids.shape[1]
         batch_decode_patterns = []
-        topk = 3
+        topk = 4
         with torch.inference_mode():
             for step in range(num_steps):
                 outputs = predictor(
