@@ -4,9 +4,10 @@ import time
 import os
 import torch
 import json
+from glob import glob
 from types import SimpleNamespace
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoConfig
 from transformers.modeling_outputs import MoEModelOutput
 from datasets import load_dataset, Dataset
 
@@ -26,17 +27,41 @@ def main(args):
         from ipdb import set_trace
         set_trace()
     device = torch.device("cuda")
-    num_experts = args.num_experts
-    NUM_LABELS = 6 * num_experts
-    tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-base")
+    data_name = args.data_name
+    home_path = os.path.expanduser('~')
+    if 'switch' in args.predictor_ckpt.lower():
+        num_experts = args.num_experts
+        NUM_LABELS = 6 * num_experts
+        tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-small")
+        dataset_name = f"marsggbo/{data_name}_switch{num_experts}_token_patterns"
+        predictor_name = f'marsggbo/t5-small_dff2048_dmodel32_token-pattern-predictor_switch{num_experts}_{data_name}'
+    else:
+        num_experts = 8
+        NUM_LABELS = 32 * num_experts
+        tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-Instruct-v0.1")
+        tokenizer.pad_token = tokenizer.eos_token
+        dataset_name = f"marsggbo/{data_name}_mixtral8x7bInstructv0.1_token_patterns"
+        predictor_name = f'marsggbo/t5-small_dff2048_dmodel32_token-pattern-predictor_mixtral8x7bInstructv0.1_{data_name}'
     tokenizer.padding_side='left'
-    predictor = AutoModelForSeq2SeqLM.from_pretrained("google-t5/t5-base")
+    ckpt_path = f"{home_path}/.cache/huggingface/hub/*{predictor_name.split('/')[-1]}/snapshots/*/*bin"
+    to_load_ckpt = True
+    try:
+        ckpt_path = glob(ckpt_path)[0]
+    except:
+
+        print(f"No checkpoint found for {predictor_name}")
+        to_load_ckpt = False
+        # exit()
+
+    # predictor_name = "marsggbo/t5-small_dff2048_dmodel32_token-pattern-predictor_switch64_wmt16" # for test
+    predictor_config = AutoConfig.from_pretrained(predictor_name)
+    predictor = AutoModelForSeq2SeqLM.from_config(config=predictor_config)
     predictor.lm_head = torch.nn.Linear(predictor.config.hidden_size, NUM_LABELS, bias=False)
-    predictor.load_state_dict(torch.load(args.predictor_ckpt, map_location=torch.device('cpu')))
+    if to_load_ckpt:
+        predictor.load_state_dict(torch.load(ckpt_path, map_location='cpu'), strict=True)
     predictor = predictor.to(device).bfloat16().eval()
 
-    dataset_name = f"marsggbo/bigbench4switch{num_experts}_pattern_predictor"
-    new_dataset_name = dataset_name.replace('_predictor', 'and_pattern_predictor_gen')
+    new_dataset_name = dataset_name.replace('_token_patterns', '_token_real_and_predicted_patterns_t5-small_dff2048_dmodel32')
     origin_dataset = load_dataset(dataset_name)['train']
     dataset = origin_dataset.shard(num_shards=len(origin_dataset)//10000, index=0)
     indices = list(range(len(dataset)))
@@ -71,12 +96,12 @@ def main(args):
                         attentions=outputs.encoder_attentions,
                     )
                 logits = outputs.logits # (bs, 1, NUM_LABELS)
-                logits = logits.view(len(batch_indices), 1, -1, num_experts) # (bs, 1, 6, num_experts)
-                top_indices = logits.topk(topk, dim=-1)[1] # (bs, 1, 6, topk)
+                logits = logits.view(len(batch_indices), 1, -1, num_experts) # (bs, 1, #layers, num_experts)
+                top_indices = logits.topk(topk, dim=-1)[1] # (bs, 1, #layers, topk)
                 batch_decode_patterns.append(top_indices.cpu())
-            batch_decode_patterns = torch.cat(batch_decode_patterns, dim=1) # (bs, seq_len, 6, topk)
+            batch_decode_patterns = torch.cat(batch_decode_patterns, dim=1) # (bs, seq_len, #layers, topk)
             decoder_patterns.append(batch_decode_patterns)
-    decoder_patterns = torch.cat(decoder_patterns, dim=0) # (num_samples, seq_len, 6, topk)
+    decoder_patterns = torch.cat(decoder_patterns, dim=0) # (num_samples, seq_len, #layers, topk)
     new_dataset = dataset.add_column('predictor_pattern', decoder_patterns.tolist())
     new_dataset.push_to_hub(new_dataset_name)
 
@@ -85,12 +110,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Benchmark on a single GPU')
 
     # 添加参数
+    parser.add_argument('--data_name', type=str, default='xsum', help='dataset name: xsum or wmt16')
     parser.add_argument('--predictor_ckpt', type=str, help='Path to predictor checkpoint')
-    parser.add_argument('--num_experts', type=int, default=32, help='number of experts per MoE layer')
+    parser.add_argument('--num_experts', type=int, default=32, help='number of experts per Switch MoE layer')
     parser.add_argument('--ipdb', action='store_true', help='Enable ipdb on error')
 
     # 解析命令行输入
     args = parser.parse_args()
     main(args)
 
-# python -m ipdb benchmark_single_gpu_switch.py --predictor_ckpt 
+# python -m ipdb gen_predictor_pattern.py --predictor_ckpt 
